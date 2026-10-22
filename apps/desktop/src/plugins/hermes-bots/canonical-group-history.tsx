@@ -1,4 +1,5 @@
 import * as sdk from '@hermes/plugin-sdk'
+import { Fragment } from 'react'
 
 import { type CanonicalGroupAttachment, CanonicalGroupAttachments } from './canonical-group-attachments'
 import { useCanonicalGroupLabels } from './canonical-group-labels'
@@ -22,7 +23,12 @@ interface CanonicalGroupHistoryProps {
   events: CanonicalGroupEvent[]
   members?: CanonicalRoomMember[]
   disabled?: boolean
+  /** Insert an @mention for this handle into the composer. */
+  onReply?: (handle: string) => void
 }
+
+const GROUP_WINDOW_S = 5 * 60
+const fmtDay = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', weekday: 'short' })
 
 function eventAuthor(event: CanonicalGroupEvent, roster: Map<string, CanonicalRoomMember>, isMessage: boolean) {
   const memberId = isMessage
@@ -73,7 +79,7 @@ function EventBody({ event, notice }: { event: CanonicalGroupEvent; notice?: str
   </div>
 }
 
-export function CanonicalGroupHistory({ binding, events, members = [], disabled = false }: CanonicalGroupHistoryProps) {
+export function CanonicalGroupHistory({ binding, events, members = [], disabled = false, onReply }: CanonicalGroupHistoryProps) {
   const labels = useCanonicalGroupLabels()
   const roster = new Map(members.map(member => [member.member_id, member]))
 
@@ -87,6 +93,9 @@ export function CanonicalGroupHistory({ binding, events, members = [], disabled 
     ['authority.lost', labels.authorityLost]
   ])
 
+  let prevDay = ''
+  let prev: { author?: string; at: number } | null = null
+
   return <>{events.map(event => {
     const notice = event.kind === 'room.activity' && event.payload.status === 'bounded'
       ? labels.workLimitReached : notices.get(event.kind)
@@ -95,15 +104,32 @@ export function CanonicalGroupHistory({ binding, events, members = [], disabled 
 
     if (!notice && !isMessage) {return null}
     const author = eventAuthor(event, roster, isMessage)
+    const at = typeof event.created_at === 'number' ? event.created_at : 0
+    const day = at ? new Date(at * 1000).toDateString() : ''
+    const newDay = !!day && day !== prevDay
+    const grouped = !newDay && isMessage && !!prev && prev.author === author && at - prev.at < GROUP_WINDOW_S
+    prevDay = day || prevDay
+    prev = isMessage ? { at, author } : null
+    const text = String(event.payload.text || event.payload.content || '')
+    const handle = event.actor?.kind === 'member' ? roster.get(event.actor.id ?? '')?.handle : undefined
 
-    return <div className="grid grid-cols-[minmax(0,1fr)] gap-1 px-2 py-1.5" key={event.seq}>
-    <div className="flex items-center gap-2">
-      {author && <strong className="text-[0.7rem] font-semibold text-(--ui-accent)">{author}</strong>}
-      <EventTime timestamp={event.created_at} />
-    </div>
-    <EventBody event={event} notice={notice} />
-    {!!event.payload.attachments?.length && <CanonicalGroupAttachments
-      attachments={event.payload.attachments.map(attachment => ({ ...attachment, event_id: event.event_id }))}
-      binding={binding} disabled={disabled || !event.event_id || event.room_id !== binding.roomId} readOnly />}
-  </div>})}</>
+    return <Fragment key={event.seq}>
+      {newDay && <div className="px-2 pt-2 text-center text-[0.625rem] text-(--ui-text-quaternary)" role="separator">{fmtDay.format(new Date(at * 1000))}</div>}
+      <div className={`group grid grid-cols-[minmax(0,1fr)] gap-1 px-2 ${grouped ? 'py-0.5' : 'py-1.5'}`}
+        data-author-id={event.actor?.id} data-seq={event.seq}>
+        <div className="flex items-center gap-2">
+          {author && !grouped && <strong className="text-[0.7rem] font-semibold text-(--ui-accent)">{author}</strong>}
+          <EventTime timestamp={event.created_at} />
+          {isMessage && text && <span className="ml-auto flex gap-2 text-[0.625rem] text-(--ui-text-quaternary) opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+            {handle && onReply && <button className="hover:text-foreground" onClick={() => onReply(handle)} type="button">Reply</button>}
+            <button className="hover:text-foreground" onClick={() => void navigator.clipboard?.writeText(text)} type="button">Copy</button>
+          </span>}
+        </div>
+        <EventBody event={event} notice={notice} />
+        {!!event.payload.attachments?.length && <CanonicalGroupAttachments
+          attachments={event.payload.attachments.map(attachment => ({ ...attachment, event_id: event.event_id }))}
+          binding={binding} disabled={disabled || !event.event_id || event.room_id !== binding.roomId} readOnly />}
+      </div>
+    </Fragment>
+  })}</>
 }

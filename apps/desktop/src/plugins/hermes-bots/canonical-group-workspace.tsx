@@ -6,6 +6,7 @@ import { type CanonicalGroupEvent, CanonicalGroupHistory } from './canonical-gro
 import { useCanonicalGroupLabels } from './canonical-group-labels'
 import { prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
 import type { PreparedCanonicalGroupSend } from './canonical-group-send'
+import { CanonicalGroupStatusStrip } from './canonical-group-status'
 import { actCanonicalGroup, canonicalGroupRequest } from './canonical-groups'
 import type { CanonicalGroupBinding, CanonicalPendingAction, CanonicalRoom, CanonicalRoomMember } from './canonical-groups'
 
@@ -38,6 +39,10 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const labels = useCanonicalGroupLabels()
   const [state, setState] = useState<RoomState | null>(null)
   const [events, setEvents] = useState<RoomEvent[]>([])
+  const eventsRef = useRef<RoomEvent[]>([])
+  const [query, setQuery] = useState('')
+  const [unseen, setUnseen] = useState(0)
+  const seenSeq = useRef(0)
   const [error, setError] = useState('')
   const [readError, setReadError] = useState('')
   const [draft, setDraft] = useState('')
@@ -83,9 +88,21 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   }
 
    
+  const lastSeq = events.at(-1)?.seq
+  const pendingCount = state?.driver_status?.pending_actions?.length
+
+  // eslint-disable-next-line no-restricted-syntax -- DOM scroll anchoring plus a new-message counter derived from the scroll position
   useEffect(() => {
-    if (stickToBottom.current) {scrollToEnd()}
-  }, [events.length, events.at(-1)?.seq, state?.driver_status?.pending_actions?.length])
+    if (stickToBottom.current) {
+      scrollToEnd()
+      setUnseen(0)
+    } else if (seenSeq.current) {
+      setUnseen(n => n + events.filter(e => e.seq > seenSeq.current && e.kind.startsWith('message')).length)
+    }
+
+    seenSeq.current = lastSeq ?? 0
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- events is read for the delta only
+  }, [lastSeq, pendingCount])
 
   // eslint-disable-next-line no-restricted-syntax -- re-anchor when the tab becomes visible again
   useEffect(() => {
@@ -106,8 +123,9 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const refresh = async () => {
     const version = ++revision.current
     const snapshot = await canonicalGroupRequest<RoomState>(binding, 'groups.state', { room_id: binding.roomId })
+    // Incremental: only fetch what is newer than the last event we already hold.
     const log: RoomEvent[] = []
-    let cursor = 0
+    let cursor = eventsRef.current.at(-1)?.seq ?? 0
 
     for (;;) {
       const page = await canonicalGroupRequest<{ events: RoomEvent[]; has_more?: boolean; next_seq?: number }>(binding, 'groups.log', { room_id: binding.roomId, since_seq: cursor, limit: 100 })
@@ -122,7 +140,12 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
 
     if (alive.current && version === revision.current) {
       setState(snapshot)
-      setEvents(log)
+
+      if (log.length) {
+        eventsRef.current = [...eventsRef.current, ...log]
+        setEvents(eventsRef.current)
+      }
+
       setReadError('')
     }
   }
@@ -193,6 +216,42 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const act = (action: CanonicalPendingAction, choice?: 'once' | 'deny') =>
     mutate(() => actCanonicalGroup(binding, action, choice))
 
+  const needle = query.trim().toLowerCase()
+
+  const shown = needle
+    ? events.filter(e => String(e.payload.text || e.payload.content || '').toLowerCase().includes(needle))
+    : events
+
+  const jumpToMember = (memberId: string) => {
+    const nodes = logRef.current?.querySelectorAll(`[data-author-id="${CSS.escape(memberId)}"]`)
+    const node = nodes?.[nodes.length - 1]
+
+    if (node) {
+      stickToBottom.current = false
+      node.scrollIntoView({ block: 'center' })
+    }
+  }
+
+  const exportTranscript = () => {
+    const roster = new Map((state?.room.members ?? []).map(m => [m.member_id, m.display_name || m.handle || m.member_id]))
+
+    const lines = events.filter(e => e.kind.startsWith('message')).map(e => {
+      const who = e.actor?.kind === 'member' ? roster.get(e.actor.id ?? '') ?? e.actor.id : e.actor?.display_name ?? 'You'
+      const when = typeof e.created_at === 'number' ? new Date(e.created_at * 1000).toLocaleString() : ''
+
+      return `**${who}** — ${when}\n\n${e.payload.text || e.payload.content || ''}\n`
+    })
+
+    const url = URL.createObjectURL(new Blob([`# ${state?.room.name ?? 'Group'}\n\n${lines.join('\n---\n\n')}`], { type: 'text/markdown' }))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${(state?.room.name ?? 'group').replace(/[^\w-]+/g, '_')}-transcript.md`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const replyTo = (handle: string) => setDraft(text => (text.includes(`@${handle} `) ? text : `@${handle} ${text}`))
+
   const composerLocked = !restored || busy || !!pending
 
   return <section className="flex h-full min-h-0 flex-col gap-3 p-3">
@@ -202,19 +261,25 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
         <h2 className="text-sm font-medium">{state?.room.name || labels.loadingGroup}</h2>
         <CanonicalGroupRoster label={labels.members} members={state?.room.members} />
       </div>
+      <input aria-label="Search messages" className="ml-auto min-w-0 max-w-40 rounded border border-(--border) bg-transparent px-2 py-0.5 text-xs" onChange={e => setQuery(e.target.value)} placeholder="Search" type="search" value={query} />
+      <Button disabled={!events.length} onClick={exportTranscript}>Export</Button>
       <Button disabled={busy || !state?.driver_status} onClick={() => void mutate(() => canonicalGroupRequest(binding, 'groups.stop', { room_id: binding.roomId, cancel_id: crypto.randomUUID() }))}>{labels.stop}</Button>
     </header>
+    <CanonicalGroupStatusStrip events={events} members={state?.room.members} onJump={jumpToMember} />
     {readError && <div role="alert">{readError}<Button onClick={() => void refresh().catch(e => setReadError(String(e)))}>{labels.refresh}</Button></div>}
     {error && <div role="alert">{error}</div>}
     {state && !state.driver_status && <p>{labels.driverUnavailable}</p>}
     <div className="min-h-0 flex-1 overflow-auto" onScroll={e => {
       const el = e.currentTarget
       stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+
+      if (stickToBottom.current) {setUnseen(0)}
     }} ref={logRef} role="log">
       <div>
-        <CanonicalGroupHistory binding={binding} disabled={!visible} events={events} members={state?.room.members} />
+        <CanonicalGroupHistory binding={binding} disabled={!visible} events={shown} members={state?.room.members} onReply={replyTo} />
       </div>
     </div>
+    {unseen > 0 && <button className="self-center rounded-full bg-(--ui-accent) px-3 py-0.5 text-xs text-white" onClick={() => { stickToBottom.current = true; scrollToEnd(); setUnseen(0) }} type="button">{unseen} new message{unseen === 1 ? '' : 's'} ↓</button>}
     {(state?.driver_status?.pending_actions || []).map(action => <div className="flex items-center gap-2" key={`${action.kind}:${action.task_id}:${action.execution_generation}`}>
       <span>{action.member_id}</span>
       {action.kind === 'discard' && <Button disabled={busy} onClick={() => setDiscard({ ...action })}>{labels.discard}</Button>}
