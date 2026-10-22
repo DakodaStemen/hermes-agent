@@ -72,6 +72,37 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     return () => { cancelled = true; alive.current = false; revision.current++ }
   }, [binding])
 
+  // Keep the log pinned to the newest message unless the user scrolled up to read history.
+  const logRef = useRef<HTMLDivElement | null>(null)
+  const stickToBottom = useRef(true)
+
+  const scrollToEnd = () => {
+    const el = logRef.current
+
+    if (el) {el.scrollTop = el.scrollHeight}
+  }
+
+   
+  useEffect(() => {
+    if (stickToBottom.current) {scrollToEnd()}
+  }, [events.length, events.at(-1)?.seq, state?.driver_status?.pending_actions?.length])
+
+  // eslint-disable-next-line no-restricted-syntax -- re-anchor when the tab becomes visible again
+  useEffect(() => {
+    if (visible) {stickToBottom.current = true; scrollToEnd()}
+  }, [visible])
+
+   
+  useEffect(() => {
+    const content = logRef.current?.firstElementChild
+
+    if (!content || typeof ResizeObserver === 'undefined') {return}
+    const observer = new ResizeObserver(() => { if (stickToBottom.current) {scrollToEnd()} })
+    observer.observe(content)
+
+    return () => observer.disconnect()
+  }, [])
+
   const refresh = async () => {
     const version = ++revision.current
     const snapshot = await canonicalGroupRequest<RoomState>(binding, 'groups.state', { room_id: binding.roomId })
@@ -176,8 +207,13 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     {readError && <div role="alert">{readError}<Button onClick={() => void refresh().catch(e => setReadError(String(e)))}>{labels.refresh}</Button></div>}
     {error && <div role="alert">{error}</div>}
     {state && !state.driver_status && <p>{labels.driverUnavailable}</p>}
-    <div className="min-h-0 flex-1 overflow-auto" role="log">
-      <CanonicalGroupHistory binding={binding} disabled={!visible} events={events} members={state?.room.members} />
+    <div className="min-h-0 flex-1 overflow-auto" onScroll={e => {
+      const el = e.currentTarget
+      stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    }} ref={logRef} role="log">
+      <div>
+        <CanonicalGroupHistory binding={binding} disabled={!visible} events={events} members={state?.room.members} />
+      </div>
     </div>
     {(state?.driver_status?.pending_actions || []).map(action => <div className="flex items-center gap-2" key={`${action.kind}:${action.task_id}:${action.execution_generation}`}>
       <span>{action.member_id}</span>

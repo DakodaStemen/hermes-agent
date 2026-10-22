@@ -36,13 +36,21 @@ function eventAuthor(event: CanonicalGroupEvent, roster: Map<string, CanonicalRo
     (isMessage ? event.actor?.id : memberId)
 }
 
+const fmtClock = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' })
+const fmtDayClock = new Intl.DateTimeFormat(undefined, { day: 'numeric', hour: 'numeric', minute: '2-digit', month: 'short' })
+const fmtFull = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'medium' })
+
+// Show the real send time (clock today, day + clock otherwise); the relative age
+// lives in the tooltip so a stale-looking "1 sec ago" can never stand in for the time.
 function EventTime({ timestamp }: { timestamp?: number }) {
   if (typeof timestamp !== 'number') {return null}
   const at = new Date(timestamp * 1000)
 
   if (!Number.isFinite(at.getTime())) {return null}
+  const sameDay = at.toDateString() === new Date().toDateString()
 
-  return <time className="text-[0.625rem] text-(--ui-text-quaternary)" dateTime={at.toISOString()}>{sdk.relativeTime(at.getTime())}</time>
+  return <time className="text-[0.625rem] text-(--ui-text-quaternary)" dateTime={at.toISOString()}
+    title={`${fmtFull.format(at)} · ${sdk.relativeTime(at.getTime())}`}>{(sameDay ? fmtClock : fmtDayClock).format(at)}</time>
 }
 
 function EventBody({ event, notice }: { event: CanonicalGroupEvent; notice?: string }) {
