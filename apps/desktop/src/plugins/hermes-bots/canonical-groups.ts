@@ -104,8 +104,8 @@ export async function createCanonicalGroup(
 ): Promise<{ binding: CanonicalGroupBinding; room: CanonicalRoom }> {
   requireRoute(route)
 
-  if (!name.trim() || members.length < 2 || members.length > 6) {
-    throw new Error('A canonical group needs a name and two to six members')
+  if (!name.trim() || members.length < 2 || members.length > 20) {
+    throw new Error('A canonical group needs a name and two to twenty members')
   }
 
   const profiles = new Set<string>()

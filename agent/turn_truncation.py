@@ -719,7 +719,20 @@ def handle_content_policy_refusal(
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
 
     _refusal_result = normalize_response_for_agent(agent, response)
-    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
+    # A classifier can interrupt an otherwise ordinary answer. That partial
+    # answer is not the refusal explanation; explicit provider metadata wins.
+    _provider_data = getattr(_refusal_result, "provider_data", None) or {}
+    _explicit_refusal = _provider_data.get("refusal")
+    _refusal_text = _explicit_refusal.strip() if isinstance(_explicit_refusal, str) else ""
+    if not _refusal_text:
+        _details = _provider_data.get("stop_details")
+        if isinstance(_details, dict):
+            _explanation = _details.get("explanation")
+            _refusal_text = _explanation.strip() if isinstance(_explanation, str) else ""
+            if not _refusal_text and _details.get("category"):
+                _refusal_text = f"provider refusal category: {_details['category']}"
+    if not _refusal_text:
+        _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
     if not _refusal_text:
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
     # Anthropic stop_reason=refusal carries its reason on stop_details (category + optional explanation),

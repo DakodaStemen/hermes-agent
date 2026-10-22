@@ -23,10 +23,10 @@ from gateway.hosted_room_task_input import validate_task_input
 from gateway.hosted_rooms_common import compact_json
 
 
-MAX_DISCUSSION_MEMBERS = 6
+MAX_DISCUSSION_MEMBERS = 20
 MIN_DISCUSSION_MEMBERS = 2
-MAX_DISCUSSION_ROUNDS = 3
-MAX_DISCUSSION_MESSAGES = 10
+MAX_DISCUSSION_ROUNDS = 10
+MAX_DISCUSSION_MESSAGES = 60
 MAX_DISCUSSION_DELTA_LINES = 24
 MAX_USER_TEXT_BYTES = 64 * 1024
 MAX_MEMBER_TEXT_BYTES = 64 * 1024
@@ -48,8 +48,8 @@ _MEMBER_CONTROL_FRAME_RE = re.compile(
 )
 _MEMBER_CONTROL_FRAME_RELABEL = "[member-quoted "
 _TURN_ID_RE = re.compile(
-    r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-2])\."
-    r"p(?P<position>[0-5])\.s(?P<seen>[1-9][0-9]*)\."
+    r"^d(?P<source>[1-9][0-9]*)\.r(?P<round>[0-9])\."
+    r"p(?P<position>[0-9]|1[0-9])\.s(?P<seen>[1-9][0-9]*)\."
     r"m(?P<member>[0-9a-f]{24})$")
 
 _TARGET_FIELDS = {
@@ -270,7 +270,7 @@ def _validate_member(raw: Any, index: int, known_profiles: set[str]) -> Discussi
 
 
 def validate_roster(value: Any, *, local_profiles: Iterable[str]) -> tuple[DiscussionMember, ...]:
-    """Validate a frozen 2-6 member roster of profiles on this gateway."""
+    """Validate a frozen 2-20 member roster of profiles on this gateway."""
     if not isinstance(value, list):
         raise DiscussionValidationError("members must be a list")
     if not MIN_DISCUSSION_MEMBERS <= len(value) <= MAX_DISCUSSION_MEMBERS:

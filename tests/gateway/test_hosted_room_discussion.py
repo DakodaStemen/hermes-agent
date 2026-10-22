@@ -658,7 +658,8 @@ def test_three_round_bound(room_db: tuple[Path, dict]):
     assert decision.reason == "max_rounds"
 
 
-def test_ten_message_bound(tmp_path: Path):
+def test_ten_message_bound(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(discussion, "MAX_DISCUSSION_MESSAGES", 10)
     db = tmp_path / "state.db"
     members = [
         {
@@ -721,8 +722,8 @@ def test_incomplete_attachment_metadata_is_rejected():
 @pytest.mark.parametrize(
     ("members", "match"),
     [
-        (MEMBERS[:1], "between 2 and 6"),
-        (MEMBERS + MEMBERS + MEMBERS[:1], "between 2 and 6"),
+        (MEMBERS[:1], "between 2 and 20"),
+        ([{"member_id": f"member-{i}", "profile": f"p{i}", "handle": f"p{i}"} for i in range(21)], "between 2 and 20"),
         (
             [MEMBERS[0], {**MEMBERS[1], "profile": "research"}],
             "profiles must be unique",

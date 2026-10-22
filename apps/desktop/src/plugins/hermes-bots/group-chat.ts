@@ -1424,7 +1424,7 @@ export const GROUP_CHAT_LOG_RETAIN = GROUP_CHAT_HISTORY_LIMIT * 2
 // ordinary traffic never hits it and a room of back-to-back pastes stays
 // well under a tenth of the quota.
 export const GROUP_CHAT_LOG_RETAIN_CHARS = GROUP_CHAT_HISTORY_CHARS * 8
-export const GROUP_CHAT_MAX_MEMBERS = 6
+export const GROUP_CHAT_MAX_MEMBERS = 20
 
 /** Transcript form of a room speaker's identity. Friendly identity wins:
  *  a Bot Mode title or a core profile display_name (e.g. default renamed to
