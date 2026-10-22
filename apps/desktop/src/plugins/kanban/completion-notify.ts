@@ -142,6 +142,14 @@ function rawErrorFor(kind: string, ev: CompletionEvent): string {
   return kind === 'gave_up' ? trimmed(ev.payload?.error) : ''
 }
 
+/** Local customization: kanban terminal-event toasts and OS notifications are
+ *  off — they piled up all day. Cursors still advance. Flip to re-enable. */
+let notificationsEnabled = false
+
+export function setKanbanNotificationsEnabled(on: boolean): void {
+  notificationsEnabled = on
+}
+
 function notifyOne(kind: string, spec: { titleKey: string; toast: ToastKind }, ev: CompletionEvent): void {
   const taskId = (ev.task_id ?? '').trim()
   const body = bodyFor(kind, ev)
@@ -206,7 +214,7 @@ export async function onKanbanEventsFrame(slug: string, events?: CompletionEvent
 
     cursor = ev.id
     seenEventIdByBoard.set(slug, cursor)
-    const spec = TERMINAL_NOTIFY.get(ev.kind ?? '')
+    const spec = notificationsEnabled ? TERMINAL_NOTIFY.get(ev.kind ?? '') : undefined
 
     if (spec) {
       try {

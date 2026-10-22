@@ -59,8 +59,10 @@ function makeRest(latest: () => number) {
 
 async function loadModule(): Promise<Mod> {
   vi.resetModules()
+  const mod = await import('./completion-notify')
+  mod.setKanbanNotificationsEnabled(true)
 
-  return import('./completion-notify')
+  return mod
 }
 
 const ev = (
