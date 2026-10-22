@@ -81,11 +81,47 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const logRef = useRef<HTMLDivElement | null>(null)
   const stickToBottom = useRef(true)
 
-  const scrollToEnd = () => {
+  const [atBottom, setAtBottom] = useState(true)
+  const [limit, setLimit] = useState(300)
+
+  // The room can sit inside a host scroll area that, not this log, does the scrolling.
+  // Scroll whichever of the two actually overflows.
+  const scroller = (): HTMLElement | null => {
     const el = logRef.current
+
+    if (!el) {return null}
+
+    return el.scrollHeight > el.clientHeight + 1
+      ? el
+      : (el.closest('[data-slot="scroll-area-viewport"]') as HTMLElement | null) ?? el
+  }
+
+  const scrollToEnd = () => {
+    const el = scroller()
 
     if (el) {el.scrollTop = el.scrollHeight}
   }
+
+  const onScrolled = () => {
+    const el = scroller()
+
+    if (!el) {return}
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+    stickToBottom.current = near
+    setAtBottom(near)
+
+    if (near) {setUnseen(0)}
+  }
+
+  useEffect(() => {
+    const viewport = logRef.current?.closest('[data-slot="scroll-area-viewport"]')
+
+    if (!viewport) {return}
+    viewport.addEventListener('scroll', onScrolled, { passive: true })
+
+    return () => viewport.removeEventListener('scroll', onScrolled)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onScrolled only reads refs and stable setters
+  }, [])
 
    
   const lastSeq = events.at(-1)?.seq
@@ -107,6 +143,7 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   // eslint-disable-next-line no-restricted-syntax -- re-anchor when the tab becomes visible again
   useEffect(() => {
     if (visible) {stickToBottom.current = true; scrollToEnd()}
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- scrollToEnd only reads refs
   }, [visible])
 
    
@@ -118,6 +155,7 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     observer.observe(content)
 
     return () => observer.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- scrollToEnd only reads refs
   }, [])
 
   const refresh = async () => {
@@ -218,9 +256,13 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
 
   const needle = query.trim().toLowerCase()
 
-  const shown = needle
+  const matched = needle
     ? events.filter(e => String(e.payload.text || e.payload.content || '').toLowerCase().includes(needle))
     : events
+
+  // Only mount the recent tail; hundreds of markdown messages make load and scroll crawl.
+  const shown = needle ? matched.slice(-500) : matched.slice(-limit)
+  const hidden = matched.length - shown.length
 
   const jumpToMember = (memberId: string) => {
     const nodes = logRef.current?.querySelectorAll(`[data-author-id="${CSS.escape(memberId)}"]`)
@@ -269,17 +311,13 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     {readError && <div role="alert">{readError}<Button onClick={() => void refresh().catch(e => setReadError(String(e)))}>{labels.refresh}</Button></div>}
     {error && <div role="alert">{error}</div>}
     {state && !state.driver_status && <p>{labels.driverUnavailable}</p>}
-    <div className="min-h-0 flex-1 overflow-auto" onScroll={e => {
-      const el = e.currentTarget
-      stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
-
-      if (stickToBottom.current) {setUnseen(0)}
-    }} ref={logRef} role="log">
+    <div className="min-h-0 flex-1 overflow-auto [scrollbar-gutter:stable] [&::-webkit-scrollbar-thumb]:bg-[color-mix(in_srgb,var(--dt-scrollbar-thumb)_35%,transparent)]" onScroll={onScrolled} ref={logRef} role="log">
       <div>
+        {hidden > 0 && <button className="mx-auto my-1 block text-xs text-(--ui-accent)" onClick={() => setLimit(n => n + 300)} type="button">Show {Math.min(hidden, 300)} earlier ({hidden} hidden)</button>}
         <CanonicalGroupHistory binding={binding} disabled={!visible} events={shown} members={state?.room.members} onReply={replyTo} />
+        {!atBottom && <button className="sticky bottom-2 left-1/2 z-10 mx-auto block w-fit rounded-full bg-(--ui-accent) px-3 py-1 text-xs text-white shadow" onClick={() => { stickToBottom.current = true; setAtBottom(true); scrollToEnd(); setUnseen(0) }} type="button">{unseen > 0 ? `${unseen} new message${unseen === 1 ? '' : 's'} ↓` : 'Latest ↓'}</button>}
       </div>
     </div>
-    {unseen > 0 && <button className="self-center rounded-full bg-(--ui-accent) px-3 py-0.5 text-xs text-white" onClick={() => { stickToBottom.current = true; scrollToEnd(); setUnseen(0) }} type="button">{unseen} new message{unseen === 1 ? '' : 's'} ↓</button>}
     {(state?.driver_status?.pending_actions || []).map(action => <div className="flex items-center gap-2" key={`${action.kind}:${action.task_id}:${action.execution_generation}`}>
       <span>{action.member_id}</span>
       {action.kind === 'discard' && <Button disabled={busy} onClick={() => setDiscard({ ...action })}>{labels.discard}</Button>}
