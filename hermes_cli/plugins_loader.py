@@ -41,6 +41,8 @@ _BARE_MODULE_SCOPE: dict[str, str] = {}  # bare module name -> owning scope_key
 # clamped to the max). A plugin that never returns is skipped with a named reason and loading moves on
 # (#108139). Python cannot kill a thread, so the worker is abandoned as a daemon; the cap bounds how many
 # abandoned loaders one process may accumulate (#98382) — past it, further loads are refused, not run inline.
+# A worker that was only slow (it finishes after the deadline, e.g. imports stalled by swap at gateway start)
+# earns ONE re-load with its already-imported module, so the plugin is not dark until the next restart.
 _LOAD_TIMEOUT_SECS = 10.0
 _MAX_LOAD_TIMEOUT_SECS = 600.0
 _MAX_ABANDONED_LOADERS = 8
@@ -103,13 +105,15 @@ def _reserve_abandoned_loader_slot() -> None:
     )
 
 
-def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[], Any]) -> Any:
+def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[], Any],
+                           on_late_success: Optional[Callable[[], None]] = None) -> Any:
     """Run ``fn`` (a plugin's import + ``register()``) under the per-plugin deadline.
 
     The worker inherits the caller's context (the Hermes-home override is a ContextVar). On timeout the
     worker is abandoned as a daemon, ``ctx`` is marked so any registration it still attempts is ignored,
     and :class:`PluginLoadTimeout` is raised on the calling thread so the usual failure path records the
-    reason and disposes whatever was registered before the hang.
+    reason and disposes whatever was registered before the hang. If the abandoned worker later finishes
+    with a truthy result, ``on_late_success`` runs once on that worker thread (it must not block).
     """
     # Re-entrant load on our own deadline worker: run inline; the outer deadline covers it.
     outer_scope = _IN_PLUGIN_LOAD.get()
@@ -125,6 +129,9 @@ def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[],
     _reserve_abandoned_loader_slot()
     outcome: list[Any] = []
     failure: list[BaseException] = []
+    # Decides, under one lock, whether the worker finished in time or was abandoned; either side may win.
+    state = {"finished": False, "abandoned": False}
+    state_lock = threading.Lock()
 
     scope = [ctx]
 
@@ -136,18 +143,31 @@ def run_with_load_deadline(plugin_key: str, ctx: PluginContext, fn: Callable[[],
             failure.append(exc)
         finally:
             _IN_PLUGIN_LOAD.reset(token)
+        with state_lock:
+            state["finished"] = True
+            late_success = state["abandoned"] and not failure and bool(outcome and outcome[0])
+        if late_success and on_late_success is not None:
+            try:
+                on_late_success()
+            except Exception:
+                logger.warning("Plugin '%s' late-load callback failed", plugin_key, exc_info=True)
 
     worker = threading.Thread(
         target=contextvars.copy_context().run, args=(_worker,), name=f"{_LOADER_THREAD_PREFIX}{plugin_key}", daemon=True,
     )
     worker.start()
     worker.join(timeout)
-    if worker.is_alive():
+    with state_lock:
+        if not state["finished"]:
+            state["abandoned"] = True
+    if state["abandoned"]:
         for loaded_ctx in scope:
             loaded_ctx._abandon_load()
         with _ABANDONED_LOADERS_LOCK:
             _ABANDONED_LOADERS.append(worker)
-        raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
+        retry = "; retried once if it finishes late" if on_late_success is not None else ""
+        raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned){retry}")
+    worker.join()  # finished under the lock; only the thread's exit remains
     if failure:
         raise failure[0]
     return outcome[0]
@@ -471,8 +491,9 @@ class PluginLoaderMixin:
         with self._discovery_lock, _plugin_home_scope(self.home_path):
             self._load_plugin_scoped(manifest)
 
-    def _load_plugin_scoped(self, manifest: PluginManifest) -> None:
-        """Load one plugin with the manager's home bound as current."""
+    def _load_plugin_scoped(self, manifest: PluginManifest, *, late_retry: bool = True) -> None:
+        """Load one plugin with the manager's home bound as current. ``late_retry`` arms the single
+        re-load of a deadline overrun that finishes late (off for that re-load itself)."""
         from hermes_cli.plugins import LoadedPlugin, PluginContext, _PLUGINS_DEBUG
         loaded = LoadedPlugin(manifest=manifest)
         plugin_key = manifest_key(manifest)
@@ -531,8 +552,14 @@ class PluginLoaderMixin:
             register_fn(ctx)
             return True
 
+        def _schedule_late_retry() -> None:
+            threading.Thread(target=contextvars.copy_context().run,
+                             args=(self._retry_late_plugin_load, manifest, loaded),
+                             name=f"plugin-late-retry:{plugin_key}", daemon=True).start()
+
         try:
-            if run_with_load_deadline(plugin_key, ctx, _import_and_register):
+            if run_with_load_deadline(plugin_key, ctx, _import_and_register,
+                                      _schedule_late_retry if late_retry else None):
                 self._attribute_registrations(loaded, plugin_key, registration_start)
                 loaded.enabled = True
                 from hermes_cli.plugins_ledger import _hook_source_of
@@ -559,6 +586,34 @@ class PluginLoaderMixin:
         if not loaded.enabled:
             self._predeclared_tools.pop(plugin_key, None)
         self._plugins[plugin_key] = loaded
+
+    def _retry_late_plugin_load(self, manifest: PluginManifest, timed_out: LoadedPlugin) -> None:
+        """Re-load a plugin whose abandoned loader finished after the deadline: it was slow, not hung.
+
+        Runs once, on its own thread, after the sweep that recorded the timeout releases the discovery
+        lock. Skipped when anything replaced that failure record meanwhile (force re-discovery, unload,
+        a successful load). The module the late worker imported is reused, so only ``register()`` runs
+        again; registrations the abandoned context attempted were refused and stay refused."""
+        plugin_key = manifest_key(manifest)
+        with self._discovery_lock, _plugin_home_scope(self.home_path):
+            if self._plugins.get(plugin_key) is not timed_out or timed_out.enabled:
+                logger.info("Plugin '%s' finished loading late; record superseded, no re-load", plugin_key)
+                return
+            loaded_before = frozenset(k for k, p in self._plugins.items() if not p.error and not p.deferred)
+            if timed_out.module is not None:
+                self._predeclared_modules[plugin_key] = timed_out.module
+            try:
+                self._load_plugin_scoped(manifest, late_retry=False)
+            finally:
+                self._predeclared_modules.pop(plugin_key, None)
+            result = self._plugins.get(plugin_key)
+            ok = bool(result and result.enabled)
+        if ok:
+            logger.warning("Plugin '%s' finished loading after its deadline; re-loaded and enabled", plugin_key)
+        else:
+            logger.warning("Plugin '%s' finished loading after its deadline; re-load failed: %s", plugin_key,
+                           getattr(result, "error", None))
+        self._notify_plugin_loaded(loaded_before)
 
     @staticmethod
     def _is_manifest_only_language_pack(manifest: PluginManifest) -> bool:

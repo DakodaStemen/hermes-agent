@@ -54,6 +54,14 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
 # sequence, so a still-running callback skips that session's next command, not another session's.
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
     "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    # on_session_start carries no tool_call_id/turn_id; without a session_id identity, parallel
+    # subagent session starts collapse into one gate key and all but one are skipped.
+    "on_session_start": ("session_id",),
+    # hermes-custom-patch:0056-on_session_start-identity
+    # on_session_end: the turn finalizer sends turn_id, but TUI close / CLI shutdown send only session_id;
+    # without it, sessions closing together (WebSocket drop, shutdown) collapse into one gate key and all
+    # but one are logged "skipped ... while still running".
+    "on_session_end": ("turn_id", "session_id"),
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).

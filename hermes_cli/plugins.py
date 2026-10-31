@@ -1056,16 +1056,16 @@ del _row
 
 
 def _ignore_after_abandoned_load(method):
-    """Turn a registrar into a no-op once the context's load timed out: the abandoned worker thread may
-    still be executing register(), and a late registration would land in registries that the failure
-    path already swept (#108139)."""
+    """No-op a registrar once the context's load timed out: the abandoned worker may still run register(),
+    and a late registration would land in registries the failure path already swept (#108139). One
+    WARNING per context; a plugin registering dozens of hooks otherwise floods errors.log."""
     @wraps(method)
     def wrapped(self, *args, **kwargs):
         if getattr(self, "_load_abandoned", False):
-            logger.warning(
-                "Plugin '%s' called %s() after its load timed out; ignored", self.manifest.name,
-                method.__name__,
-            )
+            log, self._late_call_logged = (logger.debug if getattr(self, "_late_call_logged", False)
+                                           else logger.warning), True
+            log("Plugin '%s' called %s() after its load timed out; ignored (repeats logged at DEBUG)",
+                self.manifest.name, method.__name__)
             return None
         return method(self, *args, **kwargs)
 

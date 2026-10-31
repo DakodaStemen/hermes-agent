@@ -467,7 +467,8 @@ class TestLoadIsolation:
         """A register() that never returns used to hang startup forever (#108139). Under
         ``plugins.load_timeout_seconds`` that plugin alone is recorded as failed with a named reason, its
         pre-hang registrations are disposed, later plugins still load, and anything the abandoned worker
-        registers afterwards is ignored."""
+        registers afterwards through its abandoned context is ignored. A worker that does finish late was
+        only slow: the plugin is then re-loaded once through a fresh context."""
         import sys
         import threading
         sys._deadline_gate, sys._deadline_done = threading.Event(), threading.Event()
@@ -488,7 +489,11 @@ class TestLoadIsolation:
                 assert mgr._hooks.get("pre_tool_call", []) == []  # registered before the hang → disposed
                 sys._deadline_gate.set()  # release the abandoned worker; its late registration must bounce
                 assert sys._deadline_done.wait(5)
-            assert mgr._hooks.get("post_tool_call", []) == []
+                from tests.waiting import wait_until
+                wait_until(lambda: mgr._plugins["b_slow"].enabled, what="late finisher re-loaded")
+            assert any("register_hook() after its load timed out" in r.getMessage() for r in caplog.records)
+            assert len(mgr._hooks.get("post_tool_call", [])) == 1  # from the re-load, not the abandoned ctx
+            assert len(mgr._hooks.get("pre_tool_call", [])) == 1
         finally:
             del sys._deadline_gate, sys._deadline_done
 
