@@ -25,7 +25,8 @@ never deleted.
 
 Every write happens in one transaction per state.db and first stores the original row(s) under
 ``gateway.local_policy.backup.v1:<old>:<new>:<sid>`` (one backup per rename, so a chained rename
-alpha→beta→gamma keeps both) together with a digest of what was written and the backups of the
+alpha→beta→gamma keeps both; a repeated pair alpha→beta→alpha→beta adds
+``<old>:<new>:<seq>:<sid>`` once the earlier same-pair backup is superseded) together with a digest of what was written and the backups of the
 same sid it was layered on, so :func:`rollback_local_receipts` restores byte-identical rows of the
 most recent rename only, and refuses one that changed or was superseded since.
 ``apply=False`` (the default) classifies without writing.
@@ -61,10 +62,52 @@ class _Refused(Exception):
         self.reason = reason
 
 
-def backup_key(old_name, new_name, sid):
-    """The backup of one receipt's rows for the rename *old_name* → *new_name* (profile names never
-    contain ``:``; a sid is ``local-<hex>``)."""
-    return f'{BACKUP_PREFIX}{old_name}:{new_name}:{sid}'
+def backup_key(old_name, new_name, sid, seq=1):
+    """The backup of one receipt's rows for the *seq*-th rename *old_name* → *new_name* of *sid*
+    (profile names never contain ``:``; a sid is ``local-<hex>``). The first is
+    ``<old>:<new>:<sid>``; a repeat of the same pair (alpha→beta→alpha→beta) is
+    ``<old>:<new>:<seq>:<sid>``, so the earlier one is kept as history."""
+    if seq == 1:
+        return f'{BACKUP_PREFIX}{old_name}:{new_name}:{sid}'
+    return f'{BACKUP_PREFIX}{old_name}:{new_name}:{seq}:{sid}'
+
+
+def _key_tail(old_name, new_name, key):
+    """``(seq, sid)`` of a backup key of the pair *old_name* → *new_name*, else None."""
+    prefix = backup_key(old_name, new_name, '')
+    if not key.startswith(prefix):
+        return None
+    head, sep, sid = key[len(prefix):].rpartition(':')
+    if not sep:
+        return 1, sid
+    return (int(head), sid) if head.isdigit() and int(head) >= 2 else None
+
+
+def _superseded_keys(conn):
+    """Every backup key a later backup (of any rename) names as layered on."""
+    superseded = set()
+    for (raw,) in conn.execute('SELECT value FROM state_meta WHERE substr(key,1,?)=?',
+                               (len(BACKUP_PREFIX), BACKUP_PREFIX)).fetchall():
+        try:
+            superseded.update(json.loads(raw).get('supersedes') or ())
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return superseded
+
+
+def _next_backup_key(conn, old_name, new_name, sid):
+    """The key this rename's backup of *sid* goes under, or None when a backup of the same pair is
+    still current (not superseded by a later rename's backup): re-applying would bury it."""
+    seqs = {}
+    for key in _backups_of(conn, sid):
+        tail = _key_tail(old_name, new_name, key)
+        if tail is not None and tail[1] == sid:
+            seqs[tail[0]] = key
+    if not seqs:
+        return backup_key(old_name, new_name, sid)
+    if set(seqs.values()) - _superseded_keys(conn):
+        return None
+    return backup_key(old_name, new_name, sid, max(seqs) + 1)
 
 
 def _backups_of(conn, sid):
@@ -177,9 +220,10 @@ def _plan(db, conn, sid, raw, ctx):
         return REFUSED, 'undecodable', None
     if owner == ctx['new_home']:
         return None, 'owned', None
-    if _meta(conn, backup_key(ctx['old_name'], ctx['new_name'], sid)) is not None:
-        # Only this very rename's backup blocks it: an earlier rename's (alpha→beta when migrating
-        # beta→gamma) is history the chained re-mint layers on.
+    if _next_backup_key(conn, ctx['old_name'], ctx['new_name'], sid) is None:
+        # Only a CURRENT backup of this very pair blocks it. An earlier rename's (alpha→beta when
+        # migrating beta→gamma), or this pair's own once a later rename layered on it
+        # (alpha→beta→alpha→beta), is history the re-mint layers on.
         return REFUSED, 'backup_exists', None
     if owner == ctx['old_home']:
         try:
@@ -216,7 +260,9 @@ def _write_one(conn, sid, cls, writes, meta):
     rolled back (the receipt is then left exactly as it was)."""
     conn.execute('SAVEPOINT receipt_rekey')
     try:
-        key = backup_key(meta['old_name'], meta['new_name'], sid)
+        key = _next_backup_key(conn, meta['old_name'], meta['new_name'], sid)
+        if key is None:
+            raise _Refused('backup_exists')
         backup = {'sid': sid, 'action': cls, **meta, 'rows': {k: _meta(conn, k) for k in writes},
                   'written': {k: _digest(v) for k, v in writes.items()},
                   'supersedes': sorted(_backups_of(conn, sid))}
@@ -226,6 +272,10 @@ def _write_one(conn, sid, cls, writes, meta):
         if cls == REMINT:
             from hermes_state_local_lineage import validate_local_lineage
             validate_local_lineage(conn, json.loads(writes[POLICY_PREFIX + sid]))
+    except _Refused as exc:
+        conn.execute('ROLLBACK TO receipt_rekey')
+        conn.execute('RELEASE receipt_rekey')
+        return exc.reason
     except (RuntimeStoreError, KeyError, TypeError, ValueError) as exc:
         conn.execute('ROLLBACK TO receipt_rekey')
         conn.execute('RELEASE receipt_rekey')
@@ -316,30 +366,39 @@ def rollback_local_receipts(db, *, old_name, new_name, apply=False):
     A backup is restored only while every key it wrote still holds exactly what it wrote (a receipt
     that advanced since, e.g. by a compression, is refused and kept) and no later rename's backup
     of the same sid was layered on it (roll the most recent rename back first: beta→gamma, then
-    alpha→beta). Restored backups are removed. Without *apply* this only reports what would be
-    restored.
+    alpha→beta). Of a repeated pair only the newest backup of each sid is a candidate; earlier
+    ones are counted as ``history``. Restored backups are removed. Without *apply* this only
+    reports what would be restored.
     """
     prefix = backup_key(old_name, new_name, '')
 
     def run(conn, write):
         report = {'db': str(db.db_path), 'mode': 'apply' if write else 'dry-run',
-                  'restorable': 0, 'restored': 0, 'refused': 0, 'refused_reasons': {}, 'sids': []}
+                  'restorable': 0, 'restored': 0, 'refused': 0, 'history': 0,
+                  'refused_reasons': {}, 'sids': []}
         rows = conn.execute('SELECT key, value FROM state_meta WHERE substr(key,1,?)=? ORDER BY key',
                             (len(BACKUP_PREFIX), BACKUP_PREFIX)).fetchall()
-        superseded = set()
-        for _key, raw in rows:
-            try:
-                superseded.update(json.loads(raw).get('supersedes') or ())
-            except (ValueError, TypeError, AttributeError):
-                pass
+        superseded = _superseded_keys(conn)
+        newest = {}  # sid -> seq of this pair's most recent backup: only that one is a candidate
+        for key, _raw in rows:
+            tail = _key_tail(old_name, new_name, key)
+            if tail is not None:
+                newest[tail[1]] = max(newest.get(tail[1], 0), tail[0])
         for key, raw in rows:
             if not key.startswith(prefix):
                 continue
+            tail = _key_tail(old_name, new_name, key)
+            if tail is not None and tail[0] < newest[tail[1]]:
+                # An earlier repeat of this pair (alpha→beta→alpha→beta): history the newest is
+                # layered on, restored only after the renames in between are rolled back.
+                report['history'] += 1
+                continue
             reason = None
             try:
+                tail = _key_tail(old_name, new_name, key)
                 backup = json.loads(raw)
-                if (backup.get('old_name'), backup.get('new_name')) != (old_name, new_name) \
-                        or backup.get('sid') != key[len(prefix):]:
+                if tail is None or (backup.get('old_name'), backup.get('new_name')) != (old_name, new_name) \
+                        or backup.get('sid') != tail[1]:
                     raise ValueError('backup does not name this key')
                 restore = backup['rows']
                 if key in superseded:
@@ -353,7 +412,7 @@ def rollback_local_receipts(db, *, old_name, new_name, apply=False):
                 report['refused_reasons'][reason] = report['refused_reasons'].get(reason, 0) + 1
                 continue
             report['restorable'] += 1
-            report['sids'].append(key[len(prefix):])
+            report['sids'].append(tail[1])
             if write:
                 for k, v in restore.items():
                     _put(conn, k, v)
@@ -372,6 +431,8 @@ def format_report(report):
     if 'restorable' in report:
         line = (f"{report['db']}: rollback {report['mode']}: restorable={report['restorable']} "
                 f"restored={report['restored']} refused={report['refused']}")
+        if report.get('history'):
+            line += f" history={report['history']}"
     else:
         done = 'would-remint/would-archive' if report['mode'].startswith('dry-run') else 'reminted/archived'
         line = (f"{report['db']}: receipts {report['mode']}: re-mintable={report[REMINT]} "

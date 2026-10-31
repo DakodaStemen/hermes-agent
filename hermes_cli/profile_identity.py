@@ -240,6 +240,15 @@ def _print_receipt_report(report: dict, old_canon: str, new_canon: str) -> bool:
         print(f"⚠ {own} local chat(s) created as '{old_canon}' were NOT re-minted ({reasons}) and cannot be "
               f"restored under '{new_canon}' until the cause is fixed. Then re-run:\n"
               f"    hermes profile migrate-identity {old_canon} {new_canon} --apply", file=sys.stderr)
+        if (report.get("refused_own_reasons") or {}).get("backup_exists"):
+            # Re-running alone refuses again: a current backup of this very rename is in the way.
+            print(f"  backup_exists: a current backup of {old_canon}→{new_canon} (no later rename layered "
+                  "on it) already holds those chats' earlier rows, so re-running alone is refused again. "
+                  "See whether it is restorable with:\n"
+                  f"    hermes profile migrate-identity {old_canon} {new_canon} --rollback\n"
+                  "  and restore it with --rollback --apply before re-running; if rollback refuses it "
+                  "(changed_since), the receipt was rewritten outside a rename and needs inspection.",
+                  file=sys.stderr)
         return False
     return True
 

@@ -434,3 +434,67 @@ def test_live_verb_refused_own_receipt_fails_cli(monkeypatch, capsys):
     assert 'were NOT re-minted (lineage_invalid=1)' in capsys.readouterr().err
     report.update(refused=1, refused_own=0, refused_own_reasons={}, refused_reasons={'home_exists': 1})
     assert profile_identity._migrate_profile_identity('alpha', 'beta', live_mux=True) is True
+
+
+def _swap(root, src, dst):
+    os.rename(root / 'profiles' / src, root / 'profiles' / dst)
+    return root / 'profiles' / dst / 'state.db'
+
+
+@pytest.mark.asyncio
+async def test_repeated_pair_remints_and_rolls_back_newest_first(tmp_path, monkeypatch):
+    """alpha→beta→alpha→beta: the first alpha→beta backup, superseded by beta→alpha, is history and
+    must not refuse the repeat (review t_ae8ff275). The repeat's backup gets its own key, and
+    rollback unwinds newest-first, each step byte-identical, the old one counted as history."""
+    from hermes_cli.profile_identity import _migrate_profile_identity
+    from hermes_state_local_rekey import rollback_local_receipts
+    root, sid, _ = await _create_alpha_session(tmp_path, monkeypatch)
+    era = [_meta(root / 'profiles' / 'alpha' / 'state.db')]
+    for src, dst in (('alpha', 'beta'), ('beta', 'alpha'), ('alpha', 'beta')):
+        db_path = _swap(root, src, dst)
+        assert _migrate_profile_identity(src, dst, live_mux=False) is True, (src, dst)
+        era.append(_meta(db_path))
+    receipt = json.loads(era[-1][POLICY + sid])
+    assert receipt['profile_id'].endswith('/profiles/beta') and receipt['legacy_session_id'] == sid
+    first, back, repeat = (BACKUP + sid, 'gateway.local_policy.backup.v1:beta:alpha:' + sid,
+                           BACKUP + '2:' + sid)
+    assert era[-1][first] == era[1][first], 'the first alpha→beta backup was overwritten'
+    assert json.loads(era[-1][repeat])['supersedes'] == sorted([first, back])
+    recovered, beta_id, got, *_ = await _restore_under(root, 'beta', sid)
+    assert recovered and got['profile_id'] == beta_id and got['session_id'] == sid
+
+    db_path = root / 'profiles' / 'beta' / 'state.db'
+    db = _db(db_path)
+    try:
+        steps = []
+        for old, new, want in (('alpha', 'beta', 2), ('beta', 'alpha', 1), ('alpha', 'beta', 0)):
+            report = rollback_local_receipts(db, old_name=old, new_name=new, apply=True)
+            steps.append((report['restored'], report['refused'], report['history']))
+            assert _rows(_meta(db_path), sid) == _rows(era[want], sid), (old, new)
+    finally:
+        _release(db)
+    assert steps == [(1, 0, 1), (1, 0, 0), (1, 0, 0)]
+    assert not [k for k in _meta(db_path) if k.startswith('gateway.local_policy.backup.v1:')]
+
+
+@pytest.mark.asyncio
+async def test_current_same_pair_backup_still_refuses_with_working_hint(tmp_path, monkeypatch, capsys):
+    """A same-pair backup nothing was layered on still blocks a re-mint (re-applying would bury
+    it), and the warning says how to resolve it instead of only "re-run"."""
+    from hermes_cli.profile_identity import _migrate_profile_identity
+    root, sid, _ = await _create_alpha_session(tmp_path, monkeypatch)
+    beta = _rename_dir(root)
+    assert _migrate_profile_identity('alpha', 'beta', live_mux=False) is True
+    rows = json.loads(_meta(beta / 'state.db')[BACKUP + sid])['rows']
+    db = _db(beta / 'state.db')
+    try:  # the receipt rewritten back to alpha outside any rename: no backup records it
+        db._execute_write(lambda conn: [conn.execute(
+            'UPDATE state_meta SET value=? WHERE key=?', (v, k)) if v is not None else conn.execute(
+            'DELETE FROM state_meta WHERE key=?', (k,)) for k, v in rows.items()])
+    finally:
+        _release(db)
+    capsys.readouterr()
+    assert _migrate_profile_identity('alpha', 'beta', live_mux=False) is False
+    err = capsys.readouterr().err
+    assert 'NOT re-minted (backup_exists=1)' in err
+    assert 'hermes profile migrate-identity alpha beta --rollback' in err
