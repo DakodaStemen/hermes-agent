@@ -111,6 +111,19 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
             "stopping it. Idempotent.")
     profile_migrate.add_argument("old_name", help="Profile name before the rename")
     profile_migrate.add_argument("new_name", help="Profile name after the rename")
+    profile_migrate.add_argument(
+        "--apply", action="store_true",
+        help="Rewrite local creation receipts. Without it the receipt pass is a dry run that prints "
+             "per-database counts (re-mintable / archivable / refused with reason); session/routing "
+             "identity is always migrated.")
+    profile_migrate.add_argument(
+        "--archive-foreign", action="store_true",
+        help="With --apply, move receipts that cannot be proven to belong to this profile's old "
+             "name to gateway.local_policy.archived.v1:<sid> (backed up first, never deleted).")
+    profile_migrate.add_argument(
+        "--rollback", action="store_true",
+        help="Restore the receipts a previous --apply backed up (byte-identical); dry run unless "
+             "--apply is also given. Stop the gateway first.")
 
     profile_export = profile_subparsers.add_parser("export", help="Export a profile to archive")
     profile_export.add_argument("profile_name", help="Profile to export")

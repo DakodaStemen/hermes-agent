@@ -680,7 +680,24 @@ def migrate_profile_identity_verb(runner):
                 acquired.append(profile_db)
                 db_counts["profile"] = profile_db.rekey_profile_state(old, new)
             rekeyed = store.rekey_profile_routing(old, new)
-            return {"ok": True, "rekeyed": rekeyed, "db": db_counts}
+            answer = {"ok": True, "rekeyed": rekeyed, "db": db_counts}
+            receipts = str(params.get("receipts") or "apply")
+            if receipts in ("apply", "dry-run") and profile_path is not None and profile_path.exists():
+                # Local creation receipts are durable-only (never in ``_entries``): re-minted on the
+                # profile's own store after the routing rekey above made them provable. A served
+                # authority restores them on its next recovery pass (restart / hot-serve).
+                from hermes_cli.profile_identity import rekey_profile_receipts
+                report = rekey_profile_receipts(
+                    acquired[-1], old, new, profiles_root=Path(routing_home) / "profiles",
+                    apply=receipts == "apply", archive_foreign=bool(params.get("archive_foreign")))
+                report.pop("sids", None)
+                answer["receipts"] = report
+                if report.get("refused_own"):
+                    logger.warning(
+                        "Profile identity migration %r->%r left %d local receipt(s) of the old home "
+                        "un-reminted (%s); those chats are not restorable until fixed", old, new,
+                        report["refused_own"], report.get("refused_own_reasons"))
+            return answer
         except Exception as exc:
             logger.warning("Profile identity migration failed for %r->%r: %s", old, new, exc)
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

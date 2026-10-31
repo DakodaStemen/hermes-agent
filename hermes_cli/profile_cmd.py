@@ -455,12 +455,23 @@ def _profile_migrate_identity(args):
     live gateway would not migrate (it still owns the routing index in memory), or when a
     database rejected the rewrite (collision, lock, partial failure)."""
     from hermes_cli.profile_identity import migrate_profile_identity
+    receipts = "apply" if getattr(args, "apply", False) else "dry-run"
+    if getattr(args, "archive_foreign", False) and getattr(args, "rollback", False):
+        _die("Error: --archive-foreign and --rollback are mutually exclusive")
     try:
-        migrated = migrate_profile_identity(args.old_name, args.new_name)
+        migrated = migrate_profile_identity(
+            args.old_name, args.new_name, receipts=receipts,
+            archive_foreign=getattr(args, "archive_foreign", False),
+            rollback=getattr(args, "rollback", False))
     except (ValueError, FileNotFoundError) as e:
         _die(f"Error: {e}")
+    if getattr(args, "rollback", False):
+        if not migrated:
+            _die("Error: some receipts were not restored (see above).", err=True)
+        return
     if not migrated:
-        _die(f"Error: session identity was not migrated. Restart or stop the gateway, then run:\n"
+        _die(f"Error: identity migration is incomplete (see the warnings above). Fix the cause "
+             f"(a live gateway: restart or stop it), then run:\n"
              f"    hermes profile migrate-identity {args.old_name} {args.new_name}", err=True)
     print(f"✓ Session/routing identity migrated: {args.old_name} → {args.new_name}")
 

@@ -524,13 +524,17 @@ def request_serve_profile_hot(home: Path, name: str) -> Optional[dict[str, Any]]
 
 
 def migrate_gateway_profile_identity(home: Path, old_name: str, new_name: str, *,
+                                     receipts: str = "apply", archive_foreign: bool = False,
                                      timeout: float = 8.0) -> Optional[dict[str, Any]]:
     """Ask the multiplexer serving ``home`` to rekey a renamed profile's in-memory + on-disk routing
     from ``agent:<old>:`` to ``agent:<new>:`` now. Returns its ``{"rekeyed": N, ...}`` answer, or None
     when no gateway answers / the gateway predates the verb — the CLI's durable DB rewrite still lands,
-    and a restart reconciles the in-memory copy."""
+    and a restart reconciles the in-memory copy. ``receipts``/``archive_foreign`` select whether the
+    renamed profile's local creation receipts are re-minted (``"apply"``) or only classified
+    (``"dry-run"``); the answer's ``receipts`` report is absent from a gateway older than that."""
     return query_gateway_control(home, "migrate-profile-identity",
-                                 params={"old": old_name, "new": new_name}, timeout=timeout)
+                                 params={"old": old_name, "new": new_name, "receipts": receipts,
+                                         "archive_foreign": bool(archive_foreign)}, timeout=timeout)
 
 
 def purge_gateway_profile_identity(home: Path, name: str, *,

@@ -26,7 +26,8 @@ import sys
 from pathlib import Path
 
 
-def migrate_profile_identity(old_name: str, new_name: str) -> bool:
+def migrate_profile_identity(old_name: str, new_name: str, *, receipts: str = "dry-run",
+                             archive_foreign: bool = False, rollback: bool = False) -> bool:
     """Retry the durable identity migration of a rename that already completed.
 
     ``rename_profile`` runs the migration itself; this is the standalone retry behind
@@ -41,6 +42,12 @@ def migrate_profile_identity(old_name: str, new_name: str) -> bool:
     Idempotent: re-running a completed migration succeeds with nothing left to rekey. Returns True
     when all applicable identity was migrated, False when any durable migration failed or a live
     gateway would not accept the routing migration.
+
+    Local creation receipts (``gateway.local_policy.v1:<sid>``) of the old home are reported per
+    state.db and only rewritten with ``receipts="apply"`` (see ``hermes_state_local_rekey``);
+    *archive_foreign* additionally archives receipts no rename of this profile can prove.
+    *rollback* restores the receipts this rename's re-mint/archive backed up instead (``receipts``
+    then selects dry-run or apply) and refuses while a gateway serves the store.
     """
     from hermes_cli.profiles import _canon_valid, _live_default_multiplexer, _unknown_profile_error, get_profile_dir
     old_canon = _canon_valid(old_name)
@@ -49,7 +56,13 @@ def migrate_profile_identity(old_name: str, new_name: str) -> bool:
         raise ValueError("Identity migration applies to named profiles only.")
     if not get_profile_dir(new_canon).is_dir():
         raise _unknown_profile_error(new_canon)
-    return _migrate_profile_identity(old_canon, new_canon, _live_default_multiplexer())
+    if receipts not in ("dry-run", "apply"):
+        raise ValueError(f"receipts must be 'dry-run' or 'apply', not {receipts!r}")
+    if rollback:
+        return _rollback_local_receipts(old_canon, new_canon, _live_default_multiplexer(),
+                                        apply=receipts == "apply")
+    return _migrate_profile_identity(old_canon, new_canon, _live_default_multiplexer(),
+                                     receipts=receipts, archive_foreign=archive_foreign)
 
 
 def purge_profile_identity(profile: str) -> bool:
@@ -182,27 +195,114 @@ def _migrate_checkpoint_identity(old_canon: str, new_canon: str) -> bool:
     return False
 
 
-def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) -> bool:
+def profile_home_id(canon: str) -> str:
+    """The ``profile_id`` a served profile's session authority stamps on its local receipts: the
+    profile home as an absolute resolved path (``gateway/run_runtime.py`` ``str(home)``)."""
+    from hermes_cli.profiles import get_profile_dir
+    return str(get_profile_dir(canon).resolve())
+
+
+def rekey_profile_receipts(db, old_canon: str, new_canon: str, *, profiles_root=None,
+                           apply: bool, archive_foreign: bool = False) -> dict:
+    """Re-mint (or, dry-run, classify) *db*'s local receipts for the rename *old_canon* → *new_canon*.
+
+    Shared by this process and the gateway's ``migrate-profile-identity`` verb. *profiles_root*
+    overrides where the profile homes live (the verb passes its own ``<routing home>/profiles``).
+    """
+    from hermes_state_local_rekey import rekey_local_receipts
+    if profiles_root is None:
+        old_home, new_home = Path(profile_home_id(old_canon)), Path(profile_home_id(new_canon))
+    else:
+        old_home = (Path(profiles_root) / old_canon).resolve()
+        new_home = (Path(profiles_root) / new_canon).resolve()
+    return rekey_local_receipts(
+        db, old_name=old_canon, new_name=new_canon, old_home=old_home, new_home=new_home,
+        old_live=old_home.is_dir(), apply=apply, archive_foreign=archive_foreign)
+
+
+def _print_receipt_report(report: dict, old_canon: str, new_canon: str) -> bool:
+    """Print one store's receipt report; False when a receipt of the OLD home was refused (that
+    chat cannot be restored under the new name), after an explicit warning on stderr."""
+    from hermes_state_local_rekey import format_report
+    print(("✓ " if not report.get("refused") else "⚠ ") + "Local receipts: " + format_report(report))
+    foreign = {home: n for home, n in (report.get("foreign_homes") or {}).items()}
+    if foreign:
+        print("  foreign receipt homes: " + ", ".join(f"{h}={n}" for h, n in sorted(foreign.items(), key=str)))
+    if report.get("mode", "").startswith("dry-run") and (report.get("remintable") or report.get("archivable")):
+        print("  dry-run: nothing written. Re-mint with:\n"
+              f"    hermes profile migrate-identity {old_canon} {new_canon} --apply"
+              + ("\n  archive receipts no rename of this profile can prove (never deleted) with:\n"
+                 f"    hermes profile migrate-identity {old_canon} {new_canon} --apply --archive-foreign"
+                 if report.get("archivable") else ""))
+    own = int(report.get("refused_own") or 0)
+    if own:
+        reasons = ", ".join(f"{k}={v}" for k, v in sorted((report.get("refused_own_reasons") or {}).items()))
+        print(f"⚠ {own} local chat(s) created as '{old_canon}' were NOT re-minted ({reasons}) and cannot be "
+              f"restored under '{new_canon}' until the cause is fixed. Then re-run:\n"
+              f"    hermes profile migrate-identity {old_canon} {new_canon} --apply", file=sys.stderr)
+        return False
+    return True
+
+
+def _rollback_local_receipts(old_canon: str, new_canon: str, live_mux: bool, *, apply: bool) -> bool:
+    """Restore the receipts a re-mint/archive of this rename backed up (byte-identical rows)."""
+    if live_mux and apply:
+        print("⚠ A gateway is serving these stores; stop it before rolling receipts back.", file=sys.stderr)
+        return False
+    from hermes_cli.profiles import get_profile_dir
+    from hermes_state_local_rekey import format_report, rollback_local_receipts
+    from hermes_state_registry import acquire, release_or_close
+    db_path = get_profile_dir(new_canon) / "state.db"
+    if not db_path.exists():
+        return True
+    db = acquire(db_path)
+    try:
+        report = rollback_local_receipts(db, old_name=old_canon, new_name=new_canon, apply=apply)
+    finally:
+        with contextlib.suppress(Exception):
+            release_or_close(db)
+    print("Local receipts: " + format_report(report))
+    return not report["refused"]
+
+
+def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool, *,
+                              receipts: str = "apply", archive_foreign: bool = False) -> bool:
     """Rekey renamed-profile identity without racing a live gateway's in-memory routing index.
 
     Returns True when every applicable identity was migrated. Session/routing identity is handled
     by the gateway's control verb when it owns the live store, otherwise by this process; checkpoint
     project identity is always durable-only. Never fatal to the rename, which has already happened
     by this point.
+
+    The new profile's local creation receipts are re-minted after the routing rekey (*receipts*
+    ``"apply"``, what a rename does) or only classified (``"dry-run"``, the standalone retry's
+    default); a receipt that cannot be proven a former identity of this profile is left untouched
+    unless *archive_foreign* (never part of a rename) archives it.
     """
     checkpoint_migrated = _migrate_checkpoint_identity(old_canon, new_canon)
+    apply = receipts == "apply"
 
     if live_mux:
         from hermes_constants import get_default_hermes_root
         root = get_default_hermes_root()
         try:
             from gateway.control_socket import migrate_gateway_profile_identity
-            answer = migrate_gateway_profile_identity(root, old_canon, new_canon)
+            answer = migrate_gateway_profile_identity(
+                root, old_canon, new_canon, receipts=receipts, archive_foreign=archive_foreign)
         except Exception as exc:
             reason = f"{type(exc).__name__}: {exc}"
         else:
             if isinstance(answer, dict) and answer.get("ok") is True:
-                return checkpoint_migrated
+                report = answer.get("receipts")
+                if isinstance(report, dict):
+                    receipts_ok = _print_receipt_report(report, old_canon, new_canon)
+                    return checkpoint_migrated and receipts_ok and not report.get("error")
+                print(
+                    "⚠ Session identity was migrated, but the live gateway did not process local "
+                    "receipts (an older process than this CLI). Restart the gateway, then run:\n"
+                    f"    hermes profile migrate-identity {old_canon} {new_canon}",
+                    file=sys.stderr)
+                return False
             reason = _control_answer_failure(answer)
             if answer is None and _gateway_accepts_profile_identity_verb(root):
                 reason += (" — the gateway is running but does not implement "
@@ -226,6 +326,12 @@ def _migrate_profile_identity(old_canon: str, new_canon: str, live_mux: bool) ->
         try:
             db = acquire(db_path)
             db.rekey_profile_state(old_canon, new_canon)
+            if db_path != root / "state.db":
+                # Receipts live in the profile's own store; the launch store's are the root home's.
+                if not _print_receipt_report(rekey_profile_receipts(
+                        db, old_canon, new_canon, apply=apply, archive_foreign=archive_foreign),
+                        old_canon, new_canon):
+                    migrated = False
         except Exception as exc:
             migrated = False
             print(
