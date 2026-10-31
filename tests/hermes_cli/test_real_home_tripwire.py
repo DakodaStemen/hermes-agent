@@ -216,6 +216,61 @@ def test_checkout_inside_a_guarded_root_is_not_hermes_state():
         guard.check(PROJECT_ROOT.parent / "config.yaml")
 
 
+def test_checkout_payload_manifest_probe_is_read_only_exempt():
+    """pm.environments._payload_manifest reads ``<checkout>/../manifest.json`` on every
+    bootstrap; for an in-home checkout that is ``$HERMES_HOME/manifest.json``. Reading or
+    stat'ing it is installation discovery and allowed; changing it is still refused, and a
+    look-alike name beside it is not exempt."""
+    from tests.home_io_guard import HomeIOGuard
+
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent])
+    manifest = PROJECT_ROOT.parent / "manifest.json"
+    guard.check(manifest)
+    guard.check(manifest, metadata=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(manifest, destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(PROJECT_ROOT.parent / "manifest.json.bak")
+
+
+def test_linked_worktree_git_dir_is_read_only_exempt():
+    """A worktree of an in-home checkout keeps its git dir under the home
+    (``$HERMES_HOME/hermes-agent/.git/worktrees/<name>``); the bootstrap stats
+    ``<gitdir>/hermes-update-pull`` on every import. Reads pass; changes are refused."""
+    from tests.home_io_guard import HomeIOGuard
+
+    dot_git = PROJECT_ROOT / ".git"
+    if not dot_git.is_file():
+        pytest.skip("not a linked worktree")
+    gitdir = (PROJECT_ROOT / dot_git.read_text(encoding="utf-8").strip()[len("gitdir:"):].strip()).resolve()
+    guard = HomeIOGuard(lambda: [gitdir.parent])
+    guard.check(gitdir / "hermes-update-pull", metadata=True)
+    guard.check(gitdir / "HEAD")
+    guard.check(gitdir.parent, metadata=True)  # realpath() walking up through its ancestors
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(gitdir.parent)  # ...but listing/reading an ancestor is not a probe
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(gitdir / "hermes-update-pull", destructive=True)
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        guard.check(gitdir.parent / "some-other-worktree" / "HEAD")
+
+
+def test_payload_manifest_probe_from_in_home_checkout_does_not_trip_the_guard(monkeypatch):
+    """End to end through the installed guard: the bootstrap probe returns None (no payload)
+    instead of failing the test, even when the checkout's parent is a guarded root."""
+    from tests.home_io_guard import HomeIOGuard
+    from pm.environments import _payload_manifest
+
+    manifest_present = (PROJECT_ROOT.parent / "manifest.json").exists()
+    HomeIOGuard(lambda: [PROJECT_ROOT.parent]).install(monkeypatch)
+    result = _payload_manifest(PROJECT_ROOT)
+    if not manifest_present:
+        assert result is None
+    # Never open the real sibling for writing here: a regressed guard would create it.
+    with pytest.raises(AssertionError, match="REAL hermes home"):
+        open(PROJECT_ROOT.parent / "config.yaml", encoding="utf-8")
+
+
 @pytest.mark.parametrize("kind", ["environments", "test-environment"])
 def test_pm_generation_dir_around_the_running_venv_is_the_interpreter(tmp_path, kind):
     """scripts/run_tests.sh runs ``<home>/installs/<key>/<kind>/<gen>/venv`` with HOME pointed at the

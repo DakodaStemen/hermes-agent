@@ -50,6 +50,31 @@ _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
 
 
+def _checkout_installation_paths() -> tuple[str, ...]:
+    """Paths outside the checkout that the bootstrap probes as the checkout's own installation
+    metadata; read/stat only (check() still refuses writes, replaces and deletes there).
+
+    * ``<checkout>/../manifest.json``: pm.environments._payload_manifest asks "is this checkout a
+      sealed payload?" on every bootstrap (``import gateway.run`` reaches it). In the default
+      install layout that sibling is ``$HERMES_HOME/manifest.json``.
+    * The linked worktree's git dir (``.git`` is a ``gitdir:`` file): _early_recovery probes
+      ``<gitdir>/hermes-update-pull`` on every bootstrap, and a worktree of an in-home checkout
+      keeps that dir under ``$HERMES_HOME/hermes-agent/.git/worktrees/``.
+    """
+    checkout = Path(__file__).resolve().parent.parent
+    paths = [checkout.parent / "manifest.json"]
+    try:
+        text = (checkout / ".git").read_text(encoding="utf-8").strip()
+    except OSError:  # a directory (ordinary clone: inside the checkout already) or no git at all
+        text = ""
+    if text.startswith("gitdir:"):
+        paths.append((checkout / text[len("gitdir:"):].strip()).resolve())
+    return tuple(_normcase(os.path.abspath(os.fspath(p))) for p in paths)
+
+
+_CHECKOUT_INSTALLATION_PATHS = _checkout_installation_paths()
+
+
 def _within(path: str, prefix: str) -> bool:
     """``Path(path).is_relative_to(prefix)`` for two normalized, case-folded absolute strings."""
     if path == prefix:
@@ -97,6 +122,10 @@ class HomeIOGuard:
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.
             if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
+                return
+            # realpath() of one of them lstats each ancestor, like the interpreter prefixes below.
+            if not destructive and any(_within(absolute, p) or (metadata and _contains(absolute, p))
+                                       for p in _CHECKOUT_INSTALLATION_PATHS):
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())
