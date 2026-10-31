@@ -48,11 +48,9 @@ RATE_LIMIT_EXIT_CODE = 75  # KANBAN_RATE_LIMIT_EXIT_CODE — documented worker e
 MAX_TICKS = 6  # a healthy rate-limited card is done on tick 3; the rest prove "forever"
 
 # Scenario -> (pattern, reason) for ``known_gate``; it only matches ``ReviewerNeverSpawned``.
-KNOWN: dict[str, tuple[str, str]] = {
-    "rate_limited_then_review": (
-        r"reviewer attempts=0, respawn_guarded=\[[^\]]*'blocker_auth'",
-        "#119070 stale rate-limit stamp parks the review handoff as blocker_auth"),
-}
+# #119070 landed locally (LOCAL_PATCH respawn-guard-no-quota: quota/429 text is no longer a
+# ``blocker_auth`` match), so its run-time xfail is removed and a regression now fails hard.
+KNOWN: dict[str, tuple[str, str]] = {}
 
 
 class ReviewerNeverSpawned(AssertionError):

@@ -51,8 +51,16 @@ TERMINAL_WORKER_REAP_GRACE_SECONDS = 120
 # Respawn guard constants
 # ---------------------------------------------------------------------------
 
-# Patterns in last_failure_error that indicate a quota / auth blocker.
+# Patterns in last_failure_error that indicate an auth / billing blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
+# LOCAL_PATCH respawn-guard-no-quota: quota / rate-limit / 429 are deliberately
+# NOT in this list. Quota walls are reaped as ``rate_limited`` and held by the
+# rate-limit cooldown / park (see check_respawn_guard step 1), never blocked.
+# The requeue stamps quota text into last_failure_error and nothing clears it,
+# so matching it here parked the card forever once a later run superseded the
+# rate_limited one — e.g. the review handoff never spawned a reviewer (#119070,
+# tests/e2e/core/kanban/test_kanban_rate_limit_review.py). Pinned by
+# tests/hermes_cli/test_kanban_list_undecodable_text.py.
 # The auth family is a curated list, not an open `auth\w*` stem: that stem
 # also matched ordinary English words like "author"/"authored"/"authoring"/
 # "authoritative" in worker progress prose, parking a healthy card forever

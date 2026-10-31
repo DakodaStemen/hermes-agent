@@ -97,7 +97,27 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                (sqlite3.Binary(b"429 quota exceeded"), tid),
+                (sqlite3.Binary(b"401 invalid api key"), tid),
             )
-        # BLOB last_failure_error still matches the quota/auth blocker pattern.
+        # BLOB last_failure_error still matches the auth blocker pattern.
         assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+        # Undecodable bytes degrade to U+FFFD; the auth match still holds.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                (sqlite3.Binary(b"\xff\xfe permission denied"), tid),
+            )
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        # Quota / 429 text is NOT an auth blocker (LOCAL_PATCH
+        # respawn-guard-no-quota): a stale rate-limit stamp must not park the
+        # card forever (#119070). BLOB or TEXT, it falls through to None.
+        for stale in (sqlite3.Binary(b"429 quota exceeded"), "429 quota exceeded",
+                      "pid 1 exited rate-limited (quota wall)"):
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                    (stale, tid),
+                )
+            assert kbd.check_respawn_guard(conn, tid) is None
+            assert kbd.check_respawn_guard(conn, tid, lane="review") is None
