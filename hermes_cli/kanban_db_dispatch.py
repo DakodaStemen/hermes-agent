@@ -2275,22 +2275,20 @@ def _tick_spawn_budget(
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
     # Reclaim/promotion already ran, so bookkeeping stays live; deferred tasks
     # wait for a later tick. "unknown" imposes no restriction.
+    # Logged on a level change (+ a periodic reminder), not per tick: kanban_db_pressure_log.
+    from hermes_cli.kanban_db_pressure_log import note_pressure
     pressure = _memory_pressure_level()
     if pressure == "critical":
         result.memory_pressure = pressure
-        _kb._log.warning(
-            "kanban dispatch: system memory pressure is critical; "
-            "spawning no new workers this tick (deferred, not dropped)"
-        )
+        note_pressure(pressure)
         return False, None
     if pressure == "elevated":
         result.memory_pressure = pressure
         if spawn_budget is None or spawn_budget > 1:
-            _kb._log.warning(
-                "kanban dispatch: system memory pressure is elevated; "
-                "limiting to at most 1 new worker this tick"
-            )
+            note_pressure(pressure)
             spawn_budget = 1
+        return True, spawn_budget
+    note_pressure(pressure)
     return True, spawn_budget
 
 

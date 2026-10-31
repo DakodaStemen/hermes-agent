@@ -100,6 +100,17 @@ if sys.platform == "win32":
 else:
     from logging.handlers import RotatingFileHandler
 
+# Retention is sized in bytes against a time target; rotation by time would let a burst grow a file
+# without bound. Targets, from a multi-profile host whose ROOT logs take every unrouted record
+# (~30-35 MiB/day agent.log, <=1 MiB/day errors.log, ~0.5 MiB/day gateway.log):
+#   agent.log   20 MiB x (1 + 12) = 260 MiB cap per home  -> >= 7 days at 35 MiB/day
+#   errors.log   5 MiB x (1 + 5)  =  30 MiB cap per home  -> >= 30 days at 1 MiB/day
+#   gateway.log 10 MiB x (1 + 3)  =  40 MiB cap (gateway)  -> >= 30 days at 1 MiB/day
+# Quiet profile homes only reach their caps if they log that much. ``logging.max_size_mb`` /
+# ``logging.backup_count`` override agent.log's pair.
+AGENT_LOG_MAX_MB = 20
+AGENT_LOG_BACKUPS = 12
+
 # Thread-local per-conversation session context.
 _session_context = threading.local()
 
@@ -384,8 +395,8 @@ def setup_logging(
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
     level_name = (log_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
-    backups = backup_count or cfg_backup or 3
+    max_bytes = (max_size_mb or cfg_max_size or AGENT_LOG_MAX_MB) * 1024 * 1024
+    backups = backup_count or cfg_backup or AGENT_LOG_BACKUPS
 
     from agent.redact import RedactingFormatter  # lazy: circular at module load
 
@@ -395,8 +406,8 @@ def setup_logging(
     # the file on ``mode`` and restricts it to that component's logger prefixes.
     handler_specs = (
         ("agent.log", level, max_bytes, backups, None),
-        ("errors.log", logging.WARNING, 2 * 1024 * 1024, 2, None),
-        ("gateway.log", logging.INFO, 5 * 1024 * 1024, 3, "gateway"),
+        ("errors.log", logging.WARNING, 5 * 1024 * 1024, 5, None),
+        ("gateway.log", logging.INFO, 10 * 1024 * 1024, 3, "gateway"),
         ("gui.log", logging.INFO, 10 * 1024 * 1024, 5, "gui"),
     )
     for filename, lvl, size, count, component in handler_specs:
@@ -590,6 +601,48 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         return stream
 
     def doRollover(self):
+        lock_fd = self._lock_rotating_inode()
+        try:
+            if lock_fd is not None and self._rotated_by_peer(lock_fd):
+                self._reopen_stream()
+                return
+            self._rollover_keeping_owner()
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)  # releases the flock
+
+    def _lock_rotating_inode(self) -> Optional[int]:
+        """An flock'd duplicate of the open stream's fd (POSIX), else None.
+
+        Every Hermes process sharing a ``logs/`` dir rolls the same file. Two that cross maxBytes
+        together both rename: the second renames the first's fresh, near-empty file into ``.1``,
+        so one backup slot holds a few hundred bytes and history is lost a slot early (observed:
+        a 390-byte ``agent.log.2`` between two 5 MiB backups, rotated 8 ms apart). The lock is on
+        the inode being rotated; a dup keeps it held through the stdlib's ``stream.close()``.
+        """
+        if sys.platform == "win32" or self.stream is None:
+            return None  # Windows rotates through concurrent-log-handler's own lock
+        import fcntl
+        try:
+            fd = os.dup(self.stream.fileno())
+        except (OSError, ValueError):
+            return None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError:
+            os.close(fd)
+            return None
+        return fd
+
+    def _rotated_by_peer(self, lock_fd: int) -> bool:
+        """True when another process already rotated the inode *lock_fd* holds."""
+        try:
+            held, current = os.fstat(lock_fd), os.stat(self.baseFilename)
+        except OSError:
+            return False
+        return (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
+
+    def _rollover_keeping_owner(self):
         # The stdlib rollover opens a fresh baseFilename owned by whichever process crossed
         # maxBytes. With one rotating handler per profile that is usually the long-lived root
         # gateway, and a worker on another uid can never reopen its own agent.log (#120151).

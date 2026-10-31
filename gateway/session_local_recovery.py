@@ -357,8 +357,29 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
+def _foreign_receipt_owner(authority, sid):
+    """The ``profile_id`` *sid*'s stored receipt names when it is another home's, else None.
+
+    A local session id is content-addressed by its creating home (``local_identity``), so a receipt
+    left in this ``state.db`` under another home (a profile renamed before rename rekeyed receipts)
+    can never pass ``owned_receipt`` here. Undecodable receipts answer None: the restore refuses
+    them and names the failing check."""
+    try:
+        owner = local_receipt(authority.db, sid).get('profile_id')
+    except RuntimeStoreError:
+        return None
+    return owner if isinstance(owner, str) and owner != authority.profile_id else None
+
+
 def recover_local_sessions(authority, *, schedule=False):
+    foreign = {}
     for sid in local_receipt_ids(authority):
+        owner = _foreign_receipt_owner(authority, sid)
+        if owner is not None:
+            # Every pass would refuse it again with one WARNING per receipt (boot and each hot-profile
+            # add): one summary per pass keeps it visible without burying real refusals.
+            foreign[owner] = foreign.get(owner, 0) + 1
+            continue
         try:
             ref = restore_local_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
@@ -368,6 +389,12 @@ def recover_local_sessions(authority, *, schedule=False):
             continue  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
             logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+    if foreign:
+        logging.getLogger(__name__).warning(
+            'Skipped %d local receipt(s) in %s owned by another profile home (not restorable here; '
+            'likely a profile renamed before receipts were rekeyed): %s',
+            sum(foreign.values()), authority.profile_id,
+            ', '.join(f'{home}={n}' for home, n in sorted(foreign.items())))
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
         from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
