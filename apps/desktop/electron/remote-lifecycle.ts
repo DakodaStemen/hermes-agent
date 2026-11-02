@@ -1040,6 +1040,40 @@ function withRemoteUpdateMutex(command, markerPath, hermes) {
   return `python3 -c ${shq(REMOTE_MARKER_GATE_PY)} ${markerPath} ${shq(command)} ${hermes}`
 }
 
+/** How long a managed update waits for a serve's background delegations before deferring. */
+const UPDATE_DELEGATION_WAIT_MS = 10 * 60_000
+const UPDATE_DELEGATION_POLL_MS = 5_000
+
+// Throws kind 'delegations-running' (a no-kill refusal) when the owned serve
+// still runs background delegations at the deadline.
+async function waitForOwnedDelegationsToFinish(ssh, lock, options: any = {}) {
+  const waitMs = Number.isFinite(options.waitMs) ? Math.max(0, options.waitMs) : UPDATE_DELEGATION_WAIT_MS
+  const pollMs = Number.isFinite(options.pollMs) && options.pollMs > 0 ? options.pollMs : UPDATE_DELEGATION_POLL_MS
+  const sleep = options.sleep ?? ((ms: number) => new Promise(resolve => setTimeout(resolve, ms)))
+  const now = options.now ?? Date.now
+  const deadline = now() + waitMs
+  let announced = false
+
+  while (await ownedBackendRunsDelegations(ssh, lock.pid, lock.hermesHome, lock.creationTime)) {
+    if (now() >= deadline) {
+      const error: any = new Error(
+        `The remote Hermes serve (pid ${Number(lock.pid)}) is still running background delegations; ` +
+          'the update was deferred so they are not killed. Retry once they finish.'
+      )
+
+      error.kind = 'delegations-running'
+      throw error
+    }
+
+    if (!announced) {
+      announced = true
+      options.onWaiting?.({ pid: Number(lock.pid), waitMs })
+    }
+
+    await sleep(pollMs)
+  }
+}
+
 /**
  * Stop one Desktop-owned POSIX serve before an install update.
  *
@@ -1052,7 +1086,7 @@ function withRemoteUpdateMutex(command, markerPath, hermes) {
  * behind: the post-update reconnect reclaims the now-dead exact record, while
  * an old cleanup can never unlink a replacement owner.
  */
-async function terminateOwnedDashboardForUpdate(ssh, expected) {
+async function terminateOwnedDashboardForUpdate(ssh, expected, options: any = {}) {
   const ownershipId = validateOwnershipId(expected?.ownershipId)
 
   if (!expected?.creationTime) {
@@ -1077,6 +1111,16 @@ async function terminateOwnedDashboardForUpdate(ssh, expected) {
     const error: any = new Error('The remote POSIX PID creation time no longer matches its ownership record.')
     error.kind = 'ownership-changed'
     throw error
+  }
+
+  // An update must stop the serve, but stopping it kills every background
+  // delegation it owns. The drain in main.ts has already waited (forward still
+  // up) via waitForOwnedDelegationsToFinish; this is the last-moment recheck and
+  // refuses before any signal. Callers treat the refusal like an ownership
+  // refusal: the forward is restored and the update is retried when idle. A
+  // probe failure reads as "not busy" (today's behaviour).
+  if (options.waitForDelegations !== false) {
+    await waitForOwnedDelegationsToFinish(ssh, lock, { waitMs: 0, ...options })
   }
 
   if (
@@ -1881,6 +1925,7 @@ export {
   spawnTokenPath,
   SUPPORTED_REMOTE_OS,
   terminateOwnedDashboardForUpdate,
+  waitForOwnedDelegationsToFinish,
   validateRemotePath,
   writeLockfile
 }

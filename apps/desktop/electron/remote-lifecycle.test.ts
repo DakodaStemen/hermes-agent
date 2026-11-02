@@ -37,6 +37,7 @@ import {
   READY_RE,
   remotePidAlive,
   remoteSupportsSshOwnership,
+  waitForOwnedDelegationsToFinish,
   resolveReadyTimeoutMs,
   scrapeReadyPort,
   spawnLogPath,
@@ -2319,4 +2320,76 @@ test('falls back to the default for malformed / non-positive overrides', () => {
       `override ${JSON.stringify(bad)} should fall through to the default`
     )
   }
+})
+
+test('managed update drain refuses to signal a serve that still runs background delegations', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/value=\"linux:\"/, 'linux:123456\n'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/async_delegations/, 'BUSY\n']
+  ])
+
+  await assert.rejects(terminateOwnedDashboardForUpdate(ssh, lock), err => (err as any).kind === 'delegations-running')
+  assert.ok(!ssh.calls.some(c => /pidfd_open/.test(c)), 'no signal helper may run')
+})
+
+test('managed update drain terminates when delegations are idle, probe fails, or the wait is opted out', async () => {
+  for (const probe of ['IDLE\n', new Error('python missing'), null]) {
+    const lock = ownedLock()
+
+    const ssh = fakeSsh([
+      [/cat .*lock\.json/, JSON.stringify(lock)],
+      [/kill -0 333/, 'ALIVE'],
+      [/value=\"linux:\"/, 'linux:123456\n'],
+      [/print\("OWNED"/, 'OWNED\n'],
+      [
+        /async_delegations/,
+        () => {
+          if (probe instanceof Error) {
+            throw probe
+          }
+
+          return probe ?? 'BUSY\n'
+        }
+      ],
+      [/pidfd_open/, 'TERMINATED\n']
+    ])
+
+    const result = await terminateOwnedDashboardForUpdate(ssh, lock, probe === null ? { waitForDelegations: false } : {})
+    assert.equal(result.terminated, true)
+  }
+})
+
+test('waitForOwnedDelegationsToFinish polls until idle, reports once, and throws at the deadline', async () => {
+  let clock = 0
+  let busyPolls = 2
+  const waiting: unknown[] = []
+
+  const ssh = fakeSsh([[/async_delegations/, () => (busyPolls-- > 0 ? 'BUSY\n' : 'IDLE\n')]])
+
+  const opts = {
+    waitMs: 60_000,
+    pollMs: 1000,
+    now: () => clock,
+    sleep: async (ms: number) => void (clock += ms),
+    onWaiting: (info: unknown) => waiting.push(info)
+  }
+
+  await waitForOwnedDelegationsToFinish(ssh, { pid: 9, hermesHome: '', creationTime: '' }, opts)
+  assert.equal(clock, 2000)
+  assert.equal(waiting.length, 1)
+
+  clock = 0
+
+  const stuck = fakeSsh([[/async_delegations/, 'BUSY\n']])
+
+  await assert.rejects(
+    waitForOwnedDelegationsToFinish(stuck, { pid: 9, hermesHome: '', creationTime: '' }, opts),
+    err => (err as any).kind === 'delegations-running'
+  )
+  assert.equal(clock, 60_000)
 })
