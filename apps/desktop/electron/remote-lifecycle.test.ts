@@ -43,6 +43,7 @@ import {
   spawnLogPath,
   spawnRemoteDashboard,
   spawnTokenPath,
+  terminateBootstrappedDashboardForUpdate,
   terminateOwnedDashboardForUpdate,
   validateRemotePath,
   writeLockfile
@@ -2392,4 +2393,44 @@ test('waitForOwnedDelegationsToFinish polls until idle, reports once, and throws
     err => (err as any).kind === 'delegations-running'
   )
   assert.equal(clock, 60_000)
+})
+
+function bootstrapSsh(probe: string) {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE'],
+    [/value=\"linux:\"/, 'linux:123456\n'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/async_delegations/, probe],
+    [/pidfd_open/, 'TERMINATED\n']
+  ])
+
+  return { lock, ssh }
+}
+
+test('bootstrap rollback refuses to signal a REUSED backend that runs background delegations', async () => {
+  const { lock, ssh } = bootstrapSsh('BUSY\n')
+
+  await assert.rejects(
+    terminateBootstrappedDashboardForUpdate(ssh, lock, { reused: true }),
+    err => (err as any).kind === 'delegations-running'
+  )
+  assert.ok(!ssh.calls.some(c => /pidfd_open/.test(c)), 'no signal helper may run')
+})
+
+test('bootstrap rollback treats unknown provenance as reused, and stops a freshly spawned serve at once', async () => {
+  const unknown = bootstrapSsh('BUSY\n')
+
+  await assert.rejects(
+    terminateBootstrappedDashboardForUpdate(unknown.ssh, unknown.lock, {}),
+    err => (err as any).kind === 'delegations-running'
+  )
+
+  const fresh = bootstrapSsh('BUSY\n')
+  const result = await terminateBootstrappedDashboardForUpdate(fresh.ssh, fresh.lock, { reused: false })
+
+  assert.equal(result.terminated, true)
+  assert.ok(!fresh.ssh.calls.some(c => /async_delegations/.test(c)), 'a fresh serve is not probed')
 })

@@ -9748,9 +9748,10 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
         expected
       )
     } else if (result.platform?.os === 'Linux' || result.platform?.os === 'Darwin') {
-      // The update marker is already live here and the serve must stop now: do not
-      // wait for delegations (the pre-gate drain is where they are waited for).
-      await remoteLifecycle.terminateOwnedDashboardForUpdate(ssh, expected, { waitForDelegations: false })
+      // A serve this bootstrap spawned cannot own delegations yet and stops at
+      // once; a REUSED backend keeps the busy refusal, which surfaces below as
+      // the unsafe-fence failure so the update is deferred, not the serve killed.
+      await remoteLifecycle.terminateBootstrappedDashboardForUpdate(ssh, expected, { reused: result.reused })
     } else {
       cleanupErrors.push(`unsupported remote platform ${result.platform?.os || 'unknown'}`)
     }

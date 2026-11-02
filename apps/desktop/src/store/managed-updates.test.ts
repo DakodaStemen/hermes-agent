@@ -154,6 +154,20 @@ describe('runManagedUpdate', () => {
     })
   })
 
+  it('surfaces the delegations-running deferral text instead of a generic failure', async () => {
+    const deferred =
+      'Update deferred: the remote Hermes serve is still running background delegations; retry once they finish.'
+
+    updateManaged.mockResolvedValue(
+      managedResult({ message: deferred, ok: false, outcome: 'failed', receipt: null, restoreOk: true, updateOk: false })
+    )
+
+    const state = await runManagedUpdate('remote-a')
+
+    expect(state.message).toBe(deferred)
+    expect(state.message).toMatch(/background delegations/)
+  })
+
   it('lands a failed update on failed with the stop reason as fallback message', async () => {
     updateManaged.mockResolvedValue(
       managedResult({

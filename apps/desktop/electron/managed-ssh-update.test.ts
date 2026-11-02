@@ -1039,6 +1039,36 @@ test('managed lifecycle attempts every drain and every restore when one ownershi
   assert.match(result.error || '', /foreign owner/)
 })
 
+test('a delegations-running drain refusal is reported as a deferral with its retry guidance', async () => {
+  const reason = 'The remote Hermes serve (pid 9) is still running background delegations; the update was deferred.'
+  let updateCalled = false
+
+  const result = await runManagedSshUpdate({
+    connectionId: 'home',
+    correlationId: CORRELATION,
+    scopes: [{ key: 'a', profile: 'default' }],
+    preflightRemote: async () => {},
+    drainScope: async () => {
+      throw Object.assign(new Error(reason), { kind: 'delegations-running' })
+    },
+    updateRemote: async () => {
+      updateCalled = true
+
+      return { exitCode: 0, receipt: { correlationId: CORRELATION, outcome: 'success' } }
+    },
+    awaitRestoreClearance: async () => {},
+    closeTransports: async () => {},
+    restoreScope: async () => {},
+    releaseGate: () => {}
+  })
+
+  assert.equal(updateCalled, false)
+  assert.equal(result.restoreOk, true)
+  assert.match(result.message || '', /deferred/i)
+  assert.match(result.message || '', /background delegations/)
+  assert.doesNotMatch(result.message || '', /The remote update failed/)
+})
+
 async function updateWithStuckRestore(exitCode: number, outcome: string) {
   let journalCleared = false
 

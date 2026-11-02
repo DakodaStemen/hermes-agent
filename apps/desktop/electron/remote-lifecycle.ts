@@ -1074,6 +1074,14 @@ async function waitForOwnedDelegationsToFinish(ssh, lock, options: any = {}) {
   }
 }
 
+// Bootstrap rollback/fence: a serve this bootstrap just spawned (reused === false)
+// cannot own delegations yet, so it is stopped at once. A REUSED backend may own
+// running delegations, so it gets the same busy refusal as the drain (throws
+// kind 'delegations-running'). An unknown provenance is treated as reused.
+async function terminateBootstrappedDashboardForUpdate(ssh, expected, bootstrap: any = {}) {
+  return terminateOwnedDashboardForUpdate(ssh, expected, { waitForDelegations: bootstrap.reused !== false })
+}
+
 /**
  * Stop one Desktop-owned POSIX serve before an install update.
  *
@@ -1924,6 +1932,7 @@ export {
   spawnRemoteDashboard,
   spawnTokenPath,
   SUPPORTED_REMOTE_OS,
+  terminateBootstrappedDashboardForUpdate,
   terminateOwnedDashboardForUpdate,
   waitForOwnedDelegationsToFinish,
   validateRemotePath,

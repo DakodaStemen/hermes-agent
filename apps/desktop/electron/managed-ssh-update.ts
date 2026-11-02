@@ -509,7 +509,8 @@ function withReceiptDebt(receipt: any): ManagedUpdateReceiptSummary {
 function managedUpdateMessage(
   outcome: ManagedUpdateOutcome,
   restoreOk: boolean,
-  receipt: ManagedUpdateReceiptSummary | undefined
+  receipt: ManagedUpdateReceiptSummary | undefined,
+  deferredReason = ''
 ): { owed?: ManagedUpdateOwedStep[]; message: string } {
   const followups = receipt?.followups ?? []
   const userAction = receipt?.userAction
@@ -518,9 +519,11 @@ function managedUpdateMessage(
   const status =
     outcome === 'updated'
       ? 'Remote Hermes updated'
-      : restoreOk
-        ? 'The remote update failed, but every managed SSH profile was restored.'
-        : 'The remote update transaction could not restore every managed SSH profile.'
+      : deferredReason && restoreOk
+        ? `Update deferred: ${deferredReason}`
+        : restoreOk
+          ? 'The remote update failed, but every managed SSH profile was restored.'
+          : 'The remote update transaction could not restore every managed SSH profile.'
 
   if (!owed.length) {
     return { message: outcome === 'updated' ? `${status} and every managed SSH profile is ready.` : status }
@@ -888,6 +891,7 @@ async function runManagedSshUpdate<TScope extends ManagedSshScope>(
   const { connectionId, correlationId, scopes } = deps
   let proof: RemoteUpdateProof | null = null
   let updateError = ''
+  let deferredReason = ''
   let restorationBlocked = ''
   let recoveryComplete = true
   let recoveryPrepared = false
@@ -912,6 +916,10 @@ async function runManagedSshUpdate<TScope extends ManagedSshScope>(
         await deps.drainScope(scope)
       } catch (error) {
         drainErrors.push(`${scope.profile}: ${errorMessage(error)}`)
+
+        if ((error as any)?.kind === 'delegations-running') {
+          deferredReason ||= errorMessage(error)
+        }
       }
     }
 
@@ -1000,7 +1008,7 @@ async function runManagedSshUpdate<TScope extends ManagedSshScope>(
     receipt: proof?.receipt ?? null,
     scopes: restoreResults,
     ...(error ? { error } : {}),
-    ...managedUpdateMessage(outcome, restoreOk, proof?.receipt)
+    ...managedUpdateMessage(outcome, restoreOk, proof?.receipt, deferredReason)
   }
 }
 
