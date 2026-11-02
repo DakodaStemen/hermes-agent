@@ -26,6 +26,7 @@ import {
   lockfilePath,
   MIN_READY_TIMEOUT_MS,
   openForward,
+  ownedBackendRunsDelegations,
   ownershipDirectory,
   pidIsOurDashboard,
   probeHermesVersion,
@@ -943,6 +944,81 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
   assert.ok(ours.calls.some(c => /kill 9\b/.test(c)))
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
+
+test('cleanupStale leaves a provably-ours backend alive while it runs background delegations', async () => {
+  // Killing the owner kills every delegate_task child mid-run; the next sweep
+  // books them "owner exited ... outcome unknown" (10-31/11-02 incidents).
+  const ssh = fakeSsh([
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/async_delegations/, 'BUSY\n']
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, ownedLock({ pid: 9 }))
+  assert.ok(ssh.calls.some(c => /async_delegations/.test(c)), 'must probe the delegation ledger')
+  assert.ok(!ssh.calls.some(c => /\bkill (-9 )?9\b/.test(c)), 'a busy backend must not be signalled')
+  assert.ok(
+    ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)),
+    'the lock is still dropped so a replacement can spawn and the old backend can self-retire'
+  )
+})
+
+test('disconnect keeps a backend that runs background delegations', async () => {
+  const lock = ownedLock()
+
+  const ssh = fakeSsh([
+    [/cat .*backend\.lock\.json/, JSON.stringify(lock)],
+    [/kill -0 333/, 'ALIVE\n'],
+    [/print\("OWNED"/, 'OWNED\n'],
+    [/async_delegations/, 'BUSY\n']
+  ])
+
+  await disconnect(ssh, OWNERSHIP_ID)
+  assert.ok(!ssh.calls.some(command => /\bkill (-9 )?333\b/.test(command)))
+})
+
+test('cleanupStale still reaps when the delegation probe is idle, empty or fails', async () => {
+  for (const answer of ['IDLE\n', '', new Error('exit 127: python3 not found')]) {
+    const ssh = fakeSsh([
+      [/print\("OWNED"/, 'OWNED\n'],
+      [/async_delegations/, answer]
+    ])
+
+    await cleanupStale(ssh, OWNERSHIP_ID, ownedLock({ pid: 9 }))
+    assert.ok(ssh.calls.some(c => /kill 9\b/.test(c)), `must reap on probe answer ${String(answer)}`)
+  }
+})
+
+test.skipIf(process.platform === 'win32')(
+  'delegation probe reads real ledgers: BUSY only for a running row owned by this pid and start',
+  async () => {
+    const home = await mkdtemp(path.join(process.env.TMPDIR || os.tmpdir(), 'deleg-probe-'))
+
+    try {
+      await mkdir(path.join(home, 'profiles', 'backend'), { recursive: true })
+
+      const seed = (db: string, rows: string) =>
+        exec(
+          `python3 -c ${JSON.stringify(
+            `import sqlite3;c=sqlite3.connect(${JSON.stringify(db)});` +
+              'c.execute("CREATE TABLE async_delegations (delegation_id TEXT, state TEXT, owner_pid INTEGER, owner_started_at TEXT)");' +
+              `c.executemany("INSERT INTO async_delegations VALUES (?,?,?,?)", ${rows});c.commit()`
+          )}`
+        )
+
+      await seed(path.join(home, 'state.db'), "[('a','completed',77,'100'),('b','running',78,'100')]")
+      await seed(path.join(home, 'profiles', 'backend', 'state.db'), "[('c','finalizing',77,'100')]")
+      const ssh = { exec: async (cmd: string) => (await exec(cmd)).stdout } as any
+
+      assert.equal(await ownedBackendRunsDelegations(ssh, 77, home, 'linux:100'), true)
+      assert.equal(await ownedBackendRunsDelegations(ssh, 77, home, 'linux:999'), false, 'pid reuse: other start time')
+      assert.equal(await ownedBackendRunsDelegations(ssh, 79, home, 'linux:100'), false)
+      assert.equal(await ownedBackendRunsDelegations(ssh, 78, home, ''), true)
+      assert.equal(await ownedBackendRunsDelegations(ssh, 77, path.join(home, 'missing'), ''), false)
+    } finally {
+      await rm(home, { force: true, recursive: true })
+    }
+  }
+)
 
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })

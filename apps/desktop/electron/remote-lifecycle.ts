@@ -723,7 +723,58 @@ async function pidIsOurDashboard(
   return verdict === 'OWNED'
 }
 
+// Background delegations (delegate_task children) run as threads inside the
+// backend that dispatched them and are recorded in the profile ledgers'
+// `async_delegations` table with that backend's pid as `owner_pid`. Killing the
+// backend kills every child mid-run and the next sweep books them as "owner
+// exited ... outcome unknown". Answer BUSY only when a ledger row positively
+// names this pid (and, when known, this process start) as the owner of a
+// running unit; any other answer — empty, error, unreadable ledger — keeps the
+// historical reap so this probe can never reintroduce the #91668 leak.
+async function ownedBackendRunsDelegations(ssh, pid, hermesHome = '', creationTime = '') {
+  if (!pid || !Number.isInteger(Number(pid))) {
+    return false
+  }
+
+  const startTicks = /^linux:([0-9]+)$/.exec(String(creationTime || ''))?.[1] || ''
+
+  const script =
+    'import glob,os,sqlite3,sys\n' +
+    `pid=${Number(pid)}\n` +
+    `ticks=${JSON.stringify(startTicks)}\n` +
+    'home=os.path.expanduser(sys.argv[1] or "~/.hermes")\n' +
+    'busy=False\n' +
+    'for db in [os.path.join(home,"state.db")]+sorted(glob.glob(os.path.join(home,"profiles","*","state.db"))):\n' +
+    ' if busy or not os.path.isfile(db):continue\n' +
+    ' try:\n' +
+    '  c=sqlite3.connect("file:"+db+"?mode=ro",uri=True,timeout=2)\n' +
+    '  try:\n' +
+    '   for owner,started in c.execute("SELECT owner_pid,owner_started_at FROM async_delegations WHERE state IN (\'running\',\'finalizing\')"):\n' +
+    '    if str(owner)==str(pid) and (not ticks or not started or str(started)==ticks):busy=True\n' +
+    '  finally:c.close()\n' +
+    ' except Exception:pass\n' +
+    'print("BUSY" if busy else "IDLE")'
+
+  try {
+    const out = String(
+      (await ssh.exec(`python3 -c ${shq(script)} ${shq(String(hermesHome || ''))}`)) || ''
+    ).trim()
+
+    return out === 'BUSY'
+  } catch {
+    return false
+  }
+}
+
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
+// A provably-ours backend that is still running background delegations is
+// left alive instead: the lockfile is dropped (so a replacement can spawn under
+// a new nonce) and the backend retires itself through its own watchdogs once
+// its delegations finish — `web_server_owner_exit` (lock names another nonce)
+// and `web_server_idle_exit` (no client), both gated on
+// `async_delegation.active_count()` via the retirement fence. Its finished
+// results stay in the durable ledger and the surviving process's orphan sweep
+// delivers them after the old owner exits.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   // Defense in depth (#95532): a skew sentinel is foreign/corrupt state, not
   // an ownership record — never reap or remove anything based on it.
@@ -742,7 +793,8 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
       lock.hermesHome,
       ownershipId,
       lock.profile
-    ))
+    )) &&
+    !(await ownedBackendRunsDelegations(ssh, lock.pid, lock.hermesHome, lock.creationTime))
   ) {
     try {
       const result = (
@@ -1806,6 +1858,7 @@ export {
   MIN_READY_TIMEOUT_MS,
   mintToken,
   openForward,
+  ownedBackendRunsDelegations,
   ownershipDirectory,
   pidIsOurDashboard,
   probeHermesVersion,
