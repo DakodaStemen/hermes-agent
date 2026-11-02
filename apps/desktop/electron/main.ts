@@ -9748,7 +9748,9 @@ async function rollbackSshBootstrapResult(ssh, result, profile, sshConfig, bound
         expected
       )
     } else if (result.platform?.os === 'Linux' || result.platform?.os === 'Darwin') {
-      await remoteLifecycle.terminateOwnedDashboardForUpdate(ssh, expected)
+      // The update marker is already live here and the serve must stop now: do not
+      // wait for delegations (the pre-gate drain is where they are waited for).
+      await remoteLifecycle.terminateOwnedDashboardForUpdate(ssh, expected, { waitForDelegations: false })
     } else {
       cleanupErrors.push(`unsupported remote platform ${result.platform?.os || 'unknown'}`)
     }
@@ -11226,6 +11228,18 @@ async function drainManagedSshScope(scope) {
   try {
     if (!state) {
       return
+    }
+
+    // Stopping the serve kills its background delegations. Wait for them with the
+    // forward still up (the UI stays connected); if they outlast the budget this
+    // throws 'delegations-running' before anything is torn down and the update
+    // is deferred. POSIX only: Windows keeps its own drain.
+    if (state.remotePlatform === 'Linux' || state.remotePlatform === 'Darwin') {
+      await remoteLifecycle.waitForOwnedDelegationsToFinish(state.ssh, {
+        pid: state.pid,
+        hermesHome: state.hermesHome,
+        creationTime: state.creationTime
+      })
     }
 
     terminalIpc.disposeTerminalSessionsForSshScope(scope.key)
